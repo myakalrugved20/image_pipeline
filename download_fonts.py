@@ -33,8 +33,11 @@ def download(url: str, dest: Path):
         print(f"  Already exists: {dest.name}")
         return
     print(f"  Downloading {dest.name} …")
-    urllib.request.urlretrieve(url, str(dest))
-    print(f"  Saved {dest.name} ({dest.stat().st_size / 1024:.0f} KB)")
+    try:
+        urllib.request.urlretrieve(url, str(dest))
+        print(f"  Saved {dest.name} ({dest.stat().st_size / 1024:.0f} KB)")
+    except urllib.error.HTTPError as e:
+        print(f"  Warning: could not download {dest.name} ({e}) — skipping")
 
 
 def main():
