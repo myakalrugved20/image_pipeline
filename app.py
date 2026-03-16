@@ -145,7 +145,7 @@ def create_mask(image_size: tuple[int, int], regions: list[dict]) -> Image.Image
         verts = r["vertices"]
         ys = [v[1] for v in verts]
         box_h = max(ys) - min(ys)
-        dilation = max(3, box_h // 6)
+        dilation = max(2, min(box_h // 10, 12))
 
         # Draw this region's polygon on a temp mask
         temp = Image.new("L", image_size, 0)
@@ -332,6 +332,47 @@ def _fit_font_size(text: str, target_lang: str, box_w: int, box_h: int, bold: bo
 
 # ── Text rendering (with centering) ──────────────────────────────────────
 
+import math
+
+def _calc_rotation(vertices: list) -> float:
+    """Calculate rotation angle (degrees) from OCR polygon vertices.
+
+    Vertices order: top-left, top-right, bottom-right, bottom-left.
+    Returns angle in degrees (negative = clockwise).
+    """
+    if not vertices or len(vertices) < 2:
+        return 0.0
+    v0, v1 = vertices[0], vertices[1]
+    dx = v1[0] - v0[0]
+    dy = v1[1] - v0[1]
+    angle = math.degrees(math.atan2(dy, dx))
+    # Snap to 0 if nearly horizontal (within 3 degrees)
+    if abs(angle) < 3:
+        return 0.0
+    return round(angle, 1)
+
+
+def _rotated_box_dims(vertices: list) -> tuple:
+    """Get the actual width/height of the rotated text box from polygon vertices.
+
+    Width = along the text direction (v0→v1 edge).
+    Height = perpendicular (v0→v3 edge).
+    """
+    if not vertices or len(vertices) < 4:
+        return (0, 0)
+    v0, v1, v2, v3 = vertices[:4]
+    w = math.sqrt((v1[0] - v0[0])**2 + (v1[1] - v0[1])**2)
+    h = math.sqrt((v3[0] - v0[0])**2 + (v3[1] - v0[1])**2)
+    return (round(w), round(h))
+
+
+def _polygon_center(vertices: list) -> tuple:
+    """Get the center point of a polygon."""
+    xs = [v[0] for v in vertices]
+    ys = [v[1] for v in vertices]
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
 def _detect_alignment(x0: int, box_w: int, img_w: int) -> str:
     """Heuristic alignment detection based on position within the image."""
     center_x = x0 + box_w / 2
@@ -421,6 +462,7 @@ def render_layers_on_image(
         opacity = float(layer.get("opacity", 1.0))
         font_weight = layer.get("fontWeight", "normal")
         alignment = layer.get("alignment", "center")
+        angle = float(layer.get("angle", 0))
 
         is_bold = font_weight == "bold"
 
@@ -436,27 +478,56 @@ def render_layers_on_image(
         lines = _wrap_text(text, font, w)
         lh = _line_height(font)
         total_h = len(lines) * lh
+        # Actual max line width (may exceed bounding box w with server fonts)
+        max_lw = max((font.getbbox(ln)[2] - font.getbbox(ln)[0]) for ln in lines) if lines else w
+        actual_w = max(w, max_lw)
+        actual_h = max(h, total_h)
 
-        # Create transparent overlay for this layer
-        overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
-        overlay_draw = ImageDraw.Draw(overlay)
-
-        # Vertical centering within the bounding box
-        cy = y + max(0, (h - total_h) // 2)
-
-        for line in lines:
-            line_bbox = font.getbbox(line)
-            line_w = line_bbox[2] - line_bbox[0]
-            if alignment == "left":
-                cx = x
-            elif alignment == "right":
-                cx = x + w - line_w
-            else:
-                cx = x + max(0, (w - line_w) // 2)
-            overlay_draw.text((cx, cy), line, fill=(r, g, b, alpha), font=font)
-            cy += lh
-
-        result = Image.alpha_composite(result, overlay)
+        if abs(angle) < 1:
+            # No rotation — draw directly on full overlay (fast path)
+            overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
+            overlay_draw = ImageDraw.Draw(overlay)
+            cy = y + max(0, (h - total_h) // 2)
+            for line in lines:
+                line_bbox = font.getbbox(line)
+                line_w = line_bbox[2] - line_bbox[0]
+                if alignment == "left":
+                    cx = x
+                elif alignment == "right":
+                    cx = x + w - line_w
+                else:
+                    cx = x + max(0, (w - line_w) // 2)
+                overlay_draw.text((cx, cy), line, fill=(r, g, b, alpha), font=font)
+                cy += lh
+            result = Image.alpha_composite(result, overlay)
+        else:
+            # Rotated text — render upright on a sized canvas, rotate, paste
+            pad = 8
+            canvas_w = actual_w + pad * 2
+            canvas_h = actual_h + pad * 2
+            txt_img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+            txt_draw = ImageDraw.Draw(txt_img)
+            cy = pad + max(0, (actual_h - total_h) // 2)
+            for line in lines:
+                line_bbox = font.getbbox(line)
+                line_w = line_bbox[2] - line_bbox[0]
+                if alignment == "left":
+                    cx = pad
+                elif alignment == "right":
+                    cx = pad + actual_w - line_w
+                else:
+                    cx = pad + max(0, (actual_w - line_w) // 2)
+                txt_draw.text((cx, cy), line, fill=(r, g, b, alpha), font=font)
+                cy += lh
+            # Rotate around center (negative because Pillow rotates CCW)
+            rotated = txt_img.rotate(-angle, resample=Image.BICUBIC, expand=True)
+            # Paste centered at the bounding box center
+            rw, rh = rotated.size
+            paste_x = x + w // 2 - rw // 2
+            paste_y = y + h // 2 - rh // 2
+            overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
+            overlay.paste(rotated, (paste_x, paste_y))
+            result = Image.alpha_composite(result, overlay)
 
     return result.convert("RGB")
 
@@ -575,11 +646,16 @@ async def phase1_clean(
             "regions": [],
         })
 
-    # Build mask regions from the selected boxes (convert to vertices format)
+    # Build mask regions — use tight OCR polygon when available, rectangle otherwise
     mask_regions = []
     for r in sel_regions:
-        x, y, w, h = int(r["x"]), int(r["y"]), int(r["width"]), int(r["height"])
-        verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        if "vertices" in r and r["vertices"]:
+            # Use the original tight OCR polygon vertices
+            verts = [tuple(v) for v in r["vertices"]]
+        else:
+            # Custom drawn box — use rectangle
+            x, y, w, h = int(r["x"]), int(r["y"]), int(r["width"]), int(r["height"])
+            verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
         mask_regions.append({"vertices": verts})
 
     # Inpaint only selected areas
@@ -596,8 +672,30 @@ async def phase1_clean(
         if not trans_text or w <= 0 or h <= 0:
             continue
 
-        verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-        color, is_bold = sample_text_color(original, inpainted, verts)
+        # Detect rotation angle from OCR polygon vertices
+        ocr_verts = r.get("vertices")
+        angle = 0.0
+
+        if ocr_verts and len(ocr_verts) >= 4:
+            angle = _calc_rotation(ocr_verts)
+
+        # Use the axis-aligned bounding box for everything:
+        # position, color sampling, font sizing
+        # The angle handles the visual rotation in the editor
+        sample_verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        color, is_bold = sample_text_color(original, inpainted, sample_verts)
+
+        # Check if detected color is too close to background
+        brightness = (color[0] * 299 + color[1] * 587 + color[2] * 114) / 1000
+        bg_crop = np.array(inpainted.crop((
+            max(0, x), max(0, y),
+            min(original.width, x + w), min(original.height, y + h)
+        )))
+        if bg_crop.size > 0:
+            bg_brightness = float(np.mean(bg_crop))
+            if abs(brightness - bg_brightness) < 30:
+                color = (255, 255, 255) if bg_brightness < 128 else (0, 0, 0)
+
         alignment = _detect_alignment(x, w, original.width)
         font_size = _fit_font_size(trans_text, target_lang, w, h, bold=is_bold)
         hex_color = "#{:02x}{:02x}{:02x}".format(*color)
@@ -611,6 +709,7 @@ async def phase1_clean(
             "color": hex_color,
             "bold": is_bold,
             "alignment": alignment,
+            "angle": angle,
         })
 
     return JSONResponse(content={

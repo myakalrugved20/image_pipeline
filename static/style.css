@@ -297,6 +297,14 @@ h1 { font-size: 1.8rem; font-weight: 700; text-align: center; margin-bottom: .25
   position: relative; margin: 40px;
 }
 
+/* Export stage — allow scrolling with buttons always visible */
+#phase3-view #p3-content {
+  display: flex; flex-direction: column; flex: 1; min-height: 0;
+}
+#phase3-view .compare-container { overflow: auto; }
+#phase3-view .compare-img-wrap { flex: none; }
+#phase3-view .compare-img-wrap img { max-height: none; }
+
 /* ══════════════════════════════════════════════════════════════════════════
    RESPONSIVE
    ══════════════════════════════════════════════════════════════════════════ */

@@ -38,6 +38,7 @@ const selBack      = document.getElementById("sel-back");
 const selSelectAll = document.getElementById("sel-select-all");
 const selDeselectAll = document.getElementById("sel-deselect-all");
 const selDraw      = document.getElementById("sel-draw");
+const selDelete    = document.getElementById("sel-delete");
 const selClean     = document.getElementById("sel-clean");
 const selCount     = document.getElementById("sel-count");
 const selWorkspace = document.getElementById("select-workspace");
@@ -195,170 +196,270 @@ translateBtn.addEventListener("click", async () => {
 // ══════════════════════════════════════════════════════════════════════════
 // PHASE 1: Selection — draw/toggle boxes on original image
 // ══════════════════════════════════════════════════════════════════════════
+
+/* Color a box based on its _selected flag */
+function styleBox(r) {
+  if (r._selected) {
+    r.set({
+      fill: r._isCustomRegion ? "rgba(166,227,161,0.25)" : "rgba(137,180,250,0.25)",
+      stroke: r._isCustomRegion ? "#a6e3a1" : "#89b4fa",
+    });
+  } else {
+    r.set({ fill: "rgba(243,139,168,0.15)", stroke: "#f38ba8" });
+  }
+}
+
+/* Build a Fabric rect that can be moved / resized but not rotated */
+function buildBox(props) {
+  var r = new fabric.Rect(Object.assign({
+    strokeWidth:        2,
+    strokeDashArray:    [6, 3],
+    selectable:         true,
+    evented:            true,
+    hasControls:        true,
+    hasBorders:         true,
+    lockRotation:       true,
+    cornerColor:        "#cdd6f4",
+    cornerSize:         8,
+    transparentCorners: false,
+    cornerStyle:        "circle",
+    borderColor:        "#cdd6f4",
+    hoverCursor:        "move",
+    padding:            0,
+  }, props));
+  r.setControlsVisibility({ mtr: false });   // hide rotate handle
+  return r;
+}
+
+/* Delete whichever box is Fabric-active */
+function deleteActiveBox() {
+  if (!selFc) return;
+  var a = selFc.getActiveObject();
+  if (a && (a._isOcrRegion || a._isCustomRegion)) {
+    selFc.remove(a);
+    selFc.discardActiveObject();
+    selFc.renderAll();
+    updateSelCount();
+  }
+}
+
 function openSelectionPhase() {
   setPhase("select");
-
   if (selFc) { selFc.dispose(); selFc = null; }
+  drawMode = false;
+  selDraw.classList.remove("tb-active");
 
-  requestAnimationFrame(() => {
-    const wsW = selWorkspace.clientWidth - 80;
-    const wsH = selWorkspace.clientHeight - 80;
+  requestAnimationFrame(function() {
+    var wsW = selWorkspace.clientWidth - 80;
+    var wsH = selWorkspace.clientHeight - 80;
     selBaseScale = Math.min(wsW / detectData.width, wsH / detectData.height, 1);
     if (selBaseScale <= 0) selBaseScale = 0.5;
 
-    const dw = Math.round(detectData.width * selBaseScale);
-    const dh = Math.round(detectData.height * selBaseScale);
+    var dw = Math.round(detectData.width  * selBaseScale);
+    var dh = Math.round(detectData.height * selBaseScale);
 
-    selCanvasCont.style.width = dw + "px";
+    selCanvasCont.style.width  = dw + "px";
     selCanvasCont.style.height = dh + "px";
 
-    const canvasEl = document.getElementById("select-canvas");
-    canvasEl.width = dw;
+    var canvasEl = document.getElementById("select-canvas");
+    canvasEl.width  = dw;
     canvasEl.height = dh;
 
     selFc = new fabric.Canvas("select-canvas", {
-      width: dw, height: dh,
-      selection: false,
+      width:  dw,
+      height: dh,
+      selection: false,               // no rubber-band multi-select
       preserveObjectStacking: true,
     });
 
-    // Background image
+    /* background -------------------------------------------------------- */
     fabric.Image.fromURL(detectData.original, function(img) {
       img.scaleToWidth(dw);
       selFc.setBackgroundImage(img, selFc.renderAll.bind(selFc));
     }, { crossOrigin: "anonymous" });
 
-    // Add OCR-detected regions as selectable rectangles (pre-selected)
-    detectData.regions.forEach((r, i) => {
-      const rect = new fabric.Rect({
-        left: r.x * selBaseScale,
-        top: r.y * selBaseScale,
-        width: r.width * selBaseScale,
+    /* OCR boxes --------------------------------------------------------- */
+    detectData.regions.forEach(function(r, i) {
+      var rect = buildBox({
+        left:   r.x      * selBaseScale,
+        top:    r.y      * selBaseScale,
+        width:  r.width  * selBaseScale,
         height: r.height * selBaseScale,
-        fill: "rgba(137,180,250,0.25)",
+        fill:   "rgba(137,180,250,0.25)",
         stroke: "#89b4fa",
-        strokeWidth: 2,
-        strokeDashArray: [6, 3],
-        selectable: false,
-        evented: true,
-        hoverCursor: "pointer",
-        _regionIdx: i,
-        _selected: true,
+        _regionIdx:   i,
+        _selected:    true,
         _isOcrRegion: true,
-        _regionData: r,
+        _regionData:  JSON.parse(JSON.stringify(r)),
       });
       selFc.add(rect);
     });
-
     selFc.renderAll();
     updateSelCount();
 
-    // Click to toggle region selection
-    selFc.on("mouse:down", function(opt) {
-      if (drawMode) return;
-      const target = opt.target;
-      if (target && target._isOcrRegion !== undefined) {
-        target._selected = !target._selected;
-        if (target._selected) {
-          target.set({ fill: "rgba(137,180,250,0.25)", stroke: "#89b4fa" });
-        } else {
-          target.set({ fill: "rgba(243,139,168,0.15)", stroke: "#f38ba8" });
+    /* ── move / resize vs click detection ─────────────────────────────── */
+    var _didDrag = false;
+
+    selFc.on("object:moving",  function() { _didDrag = true; });
+    selFc.on("object:scaling", function() { _didDrag = true; });
+
+    selFc.on("mouse:down", function() {
+      _didDrag = false;
+    });
+
+    selFc.on("mouse:up", function(opt) {
+      if (drawMode) return;          // handled by draw-mode block below
+      var t = opt.target;
+      if (!t || (!t._isOcrRegion && !t._isCustomRegion)) return;
+
+      if (_didDrag) {
+        /* box was moved or resized ─ update stored coords */
+        if (t._isOcrRegion && t._regionData) {
+          var sx = t.scaleX || 1, sy = t.scaleY || 1;
+          t._regionData.x      = Math.round(t.left / selBaseScale);
+          t._regionData.y      = Math.round(t.top  / selBaseScale);
+          t._regionData.width  = Math.round((t.width  * sx) / selBaseScale);
+          t._regionData.height = Math.round((t.height * sy) / selBaseScale);
         }
+      } else {
+        /* pure click ─ toggle selected/deselected */
+        t._selected = !t._selected;
+        styleBox(t);
         selFc.renderAll();
         updateSelCount();
       }
+      _didDrag = false;
     });
 
-    // Draw mode: let user draw custom rectangles
-    let drawStart = null;
-    let drawRect = null;
+    /* ── draw mode ─────────────────────────────────────────────────────── */
+    var _drawOrigin = null;
+    var _drawRect   = null;
 
     selFc.on("mouse:down", function(opt) {
       if (!drawMode) return;
-      if (opt.target && (opt.target._isOcrRegion || opt.target._isCustomRegion)) return;
-      const ptr = selFc.getPointer(opt.e);
-      drawStart = { x: ptr.x, y: ptr.y };
-      drawRect = new fabric.Rect({
+      if (opt.target) return;           // clicked an existing box
+      selFc.discardActiveObject();      // clear selection
+      var ptr = selFc.getPointer(opt.e);
+      _drawOrigin = { x: ptr.x, y: ptr.y };
+      _drawRect = new fabric.Rect({
         left: ptr.x, top: ptr.y, width: 0, height: 0,
         fill: "rgba(166,227,161,0.25)",
         stroke: "#a6e3a1",
         strokeWidth: 2,
+        strokeDashArray: [6, 3],
         selectable: false,
-        evented: true,
-        hoverCursor: "pointer",
-        _selected: true,
+        evented:    false,
+        _selected:       true,
         _isCustomRegion: true,
       });
-      selFc.add(drawRect);
+      selFc.add(_drawRect);
     });
 
     selFc.on("mouse:move", function(opt) {
-      if (!drawMode || !drawStart || !drawRect) return;
-      const ptr = selFc.getPointer(opt.e);
-      const x = Math.min(drawStart.x, ptr.x);
-      const y = Math.min(drawStart.y, ptr.y);
-      const w = Math.abs(ptr.x - drawStart.x);
-      const h = Math.abs(ptr.y - drawStart.y);
-      drawRect.set({ left: x, top: y, width: w, height: h });
+      if (!drawMode || !_drawOrigin || !_drawRect) return;
+      var ptr = selFc.getPointer(opt.e);
+      _drawRect.set({
+        left:   Math.min(_drawOrigin.x, ptr.x),
+        top:    Math.min(_drawOrigin.y, ptr.y),
+        width:  Math.abs(ptr.x - _drawOrigin.x),
+        height: Math.abs(ptr.y - _drawOrigin.y),
+      });
       selFc.renderAll();
     });
 
     selFc.on("mouse:up", function() {
-      if (!drawMode || !drawRect) return;
-      // Remove if too small
-      if (drawRect.width < 5 || drawRect.height < 5) {
-        selFc.remove(drawRect);
+      if (!drawMode || !_drawRect) return;
+      if (_drawRect.width < 5 || _drawRect.height < 5) {
+        selFc.remove(_drawRect);
+      } else {
+        /* finished drawing → make it fully interactive */
+        _drawRect.set({
+          selectable:         true,
+          evented:            true,
+          hasControls:        true,
+          hasBorders:         true,
+          lockRotation:       true,
+          cornerColor:        "#cdd6f4",
+          cornerSize:         8,
+          transparentCorners: false,
+          cornerStyle:        "circle",
+          borderColor:        "#cdd6f4",
+          hoverCursor:        "move",
+        });
+        _drawRect.setControlsVisibility({ mtr: false });
+        selFc.setActiveObject(_drawRect);
+        selFc.renderAll();
       }
-      drawStart = null;
-      drawRect = null;
+      _drawOrigin = null;
+      _drawRect   = null;
       updateSelCount();
     });
+
+    /* keyboard delete */
+    document.addEventListener("keydown", _selKeyHandler);
   });
+}
+
+/* keyboard handler – lives outside so we can remove it */
+function _selKeyHandler(e) {
+  if (appPhase !== "select" || !selFc) return;
+  if (e.key === "Delete" || e.key === "Backspace") {
+    var a = selFc.getActiveObject();
+    if (a && (a._isOcrRegion || a._isCustomRegion)) {
+      e.preventDefault();
+      deleteActiveBox();
+    }
+  }
 }
 
 function updateSelCount() {
   if (!selFc) return;
-  const objs = selFc.getObjects();
-  const selected = objs.filter(o => (o._isOcrRegion || o._isCustomRegion) && o._selected);
-  selCount.textContent = `${selected.length} selected`;
+  var n = selFc.getObjects().filter(function(o) {
+    return (o._isOcrRegion || o._isCustomRegion) && o._selected;
+  }).length;
+  selCount.textContent = n + " selected";
 }
 
-selBack.addEventListener("click", () => {
+/* ── toolbar buttons ──────────────────────────────────────────────────── */
+selBack.addEventListener("click", function() {
+  document.removeEventListener("keydown", _selKeyHandler);
   if (selFc) { selFc.dispose(); selFc = null; }
   setPhase("upload");
 });
 
-selSelectAll.addEventListener("click", () => {
+selSelectAll.addEventListener("click", function() {
   if (!selFc) return;
-  selFc.getObjects().forEach(o => {
-    if (o._isOcrRegion || o._isCustomRegion) {
-      o._selected = true;
-      o.set({ fill: o._isCustomRegion ? "rgba(166,227,161,0.25)" : "rgba(137,180,250,0.25)",
-              stroke: o._isCustomRegion ? "#a6e3a1" : "#89b4fa" });
-    }
+  selFc.getObjects().forEach(function(o) {
+    if (o._isOcrRegion || o._isCustomRegion) { o._selected = true; styleBox(o); }
   });
   selFc.renderAll();
   updateSelCount();
 });
 
-selDeselectAll.addEventListener("click", () => {
+selDeselectAll.addEventListener("click", function() {
   if (!selFc) return;
-  selFc.getObjects().forEach(o => {
-    if (o._isOcrRegion || o._isCustomRegion) {
-      o._selected = false;
-      o.set({ fill: "rgba(243,139,168,0.15)", stroke: "#f38ba8" });
-    }
+  selFc.getObjects().forEach(function(o) {
+    if (o._isOcrRegion || o._isCustomRegion) { o._selected = false; styleBox(o); }
   });
   selFc.renderAll();
   updateSelCount();
 });
 
-selDraw.addEventListener("click", () => {
+if (selDelete) selDelete.addEventListener("click", deleteActiveBox);
+
+selDraw.addEventListener("click", function() {
   drawMode = !drawMode;
   selDraw.classList.toggle("tb-active", drawMode);
-  if (selFc) {
-    selFc.defaultCursor = drawMode ? "crosshair" : "default";
-  }
+  if (!selFc) return;
+  selFc.defaultCursor = drawMode ? "crosshair" : "default";
+  /* while drawing, make existing boxes non-selectable so drags create new rects */
+  selFc.forEachObject(function(o) {
+    if (o._isOcrRegion || o._isCustomRegion) {
+      o.selectable = !drawMode;
+    }
+  });
+  if (drawMode) selFc.discardActiveObject();
+  selFc.renderAll();
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -372,16 +473,36 @@ selClean.addEventListener("click", async () => {
   selFc.getObjects().forEach(o => {
     if (!o._selected) return;
     if (o._isOcrRegion) {
-      selectedRegions.push(o._regionData);
+      const scaleX = o.scaleX || 1;
+      const scaleY = o.scaleY || 1;
+      const newX = Math.round(o.left / selBaseScale);
+      const newY = Math.round(o.top / selBaseScale);
+      const newW = Math.round((o.width * scaleX) / selBaseScale);
+      const newH = Math.round((o.height * scaleY) / selBaseScale);
+      const orig = o._regionData;
+      // Check if box was moved or resized
+      const wasMoved = (newX !== orig.x || newY !== orig.y ||
+                        newW !== orig.width || newH !== orig.height);
+      const updatedData = {
+        originalText: orig.originalText,
+        translatedText: orig.translatedText,
+        x: newX, y: newY, width: newW, height: newH,
+      };
+      // Keep tight OCR vertices only if the box wasn't moved/resized
+      if (!wasMoved && orig.vertices) {
+        updatedData.vertices = orig.vertices;
+      }
+      selectedRegions.push(updatedData);
     } else if (o._isCustomRegion) {
-      // Custom drawn box — no text data, just the area to inpaint
+      const scaleX = o.scaleX || 1;
+      const scaleY = o.scaleY || 1;
       selectedRegions.push({
         originalText: "",
         translatedText: "",
         x: Math.round(o.left / selBaseScale),
         y: Math.round(o.top / selBaseScale),
-        width: Math.round(o.width / selBaseScale),
-        height: Math.round(o.height / selBaseScale),
+        width: Math.round((o.width * scaleX) / selBaseScale),
+        height: Math.round((o.height * scaleY) / selBaseScale),
       });
     }
   });
@@ -478,9 +599,8 @@ function buildCanvas(data) {
 
     // Text layers
     data.layers.forEach(l => {
-      const t = new fabric.IText(l.translatedText, {
-        left:       l.x * baseScale,
-        top:        l.y * baseScale,
+      const ang = l.angle || 0;
+      const opts = {
         fontSize:   l.fontSize * baseScale,
         fill:       l.color,
         fontFamily: "sans-serif",
@@ -489,11 +609,23 @@ function buildCanvas(data) {
         underline:  false,
         editable:   true,
         opacity:    1,
+        angle:      ang,
         _name:      l.translatedText.substring(0, 28),
         _boxW:      l.width,
         _boxH:      l.height,
         _alignment: l.alignment || "center",
-      });
+      };
+      // For rotated text, position from center of bounding box
+      if (Math.abs(ang) > 1) {
+        opts.originX = "center";
+        opts.originY = "center";
+        opts.left = (l.x + l.width / 2) * baseScale;
+        opts.top  = (l.y + l.height / 2) * baseScale;
+      } else {
+        opts.left = l.x * baseScale;
+        opts.top  = l.y * baseScale;
+      }
+      const t = new fabric.IText(l.translatedText, opts);
       fc.add(t);
     });
 
@@ -682,20 +814,30 @@ btnExport.addEventListener("click", async () => {
   fc.discardActiveObject(); fc.renderAll();
 
   // Collect layer data from Fabric canvas → original image coordinates
-  const layers = fc.getObjects().filter(o => o.type === "i-text").map(o => ({
-    text:       o.text,
-    x:          Math.round(o.left / baseScale),
-    y:          Math.round(o.top / baseScale),
-    width:      Math.round((o.width * o.scaleX) / baseScale),
-    height:     Math.round((o.height * o.scaleY) / baseScale),
-    fontSize:   Math.round(o.fontSize * o.scaleY / baseScale),
-    color:      rgbToHex(o.fill),
-    fontFamily: o.fontFamily || "sans-serif",
-    fontWeight: o.fontWeight || "normal",
-    fontStyle:  o.fontStyle || "normal",
-    opacity:    o.opacity != null ? o.opacity : 1,
-    alignment:  o._alignment || "center",
-  }));
+  const layers = fc.getObjects().filter(o => o.type === "i-text").map(o => {
+    const w = Math.round((o.width * o.scaleX) / baseScale);
+    const h = Math.round((o.height * o.scaleY) / baseScale);
+    let lx = Math.round(o.left / baseScale);
+    let ly = Math.round(o.top / baseScale);
+    // If object uses center origin (rotated text), convert to top-left
+    if (o.originX === "center") lx = lx - Math.round(w / 2);
+    if (o.originY === "center") ly = ly - Math.round(h / 2);
+    return {
+      text:       o.text,
+      x:          lx,
+      y:          ly,
+      width:      w,
+      height:     h,
+      fontSize:   Math.round(o.fontSize * o.scaleY / baseScale),
+      color:      rgbToHex(o.fill),
+      fontFamily: o.fontFamily || "sans-serif",
+      fontWeight: o.fontWeight || "normal",
+      fontStyle:  o.fontStyle || "normal",
+      opacity:    o.opacity != null ? o.opacity : 1,
+      alignment:  o._alignment || "center",
+      angle:      o.angle || 0,
+    };
+  });
 
   // Switch to export phase with loading state
   setPhase("export");
