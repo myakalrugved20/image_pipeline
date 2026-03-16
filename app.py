@@ -1,0 +1,756 @@
+import os
+import io
+import json
+import base64
+import textwrap
+from pathlib import Path
+
+# Uses Application Default Credentials (ADC) — run:
+#   gcloud auth application-default login
+# to authenticate with your Google account.
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from fastapi import FastAPI, UploadFile, Form, HTTPException, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from google.cloud import vision
+from deep_translator import GoogleTranslator
+from simple_lama_inpainting import SimpleLama
+from sklearn.cluster import KMeans
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+FONT_DIR = BASE_DIR / "fonts"
+
+app = FastAPI(title="Image Text Translator")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+# Load LaMa once (heavy model)
+print("Loading LaMa inpainting model …")
+lama = SimpleLama()
+print("LaMa ready.")
+
+# Google Vision client
+vision_client = vision.ImageAnnotatorClient()
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+LANG_MAP = None  # lazy-loaded
+
+
+def _get_languages() -> dict:
+    """Return {code: name} dict of supported languages."""
+    global LANG_MAP
+    if LANG_MAP is None:
+        LANG_MAP = GoogleTranslator(source="auto", target="en").get_supported_languages(
+            as_dict=True
+        )
+    return LANG_MAP
+
+
+# ── OCR ───────────────────────────────────────────────────────────────────
+
+def detect_text(image_bytes: bytes) -> list[dict]:
+    """Use Google Vision full_text_annotation to get paragraph-level blocks.
+
+    Filters out small/icon text regions to avoid damaging graphics.
+    """
+    image = vision.Image(content=image_bytes)
+    try:
+        response = vision_client.text_detection(image=image)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Vision API error: {exc}")
+
+    if response.error.message:
+        raise HTTPException(status_code=502, detail=f"Vision API error: {response.error.message}")
+
+    if not response.full_text_annotation.pages:
+        return []
+
+    regions = []
+    for page in response.full_text_annotation.pages:
+        for block in page.blocks:
+            for paragraph in block.paragraphs:
+                text = ""
+                for word in paragraph.words:
+                    word_text = "".join(s.text for s in word.symbols)
+                    text += word_text + " "
+                text = text.strip()
+                if not text:
+                    continue
+
+                verts = paragraph.bounding_box.vertices
+                vertices = [(v.x, v.y) for v in verts]
+
+                # ── Filter out small / icon text ──
+                xs = [v[0] for v in vertices]
+                ys = [v[1] for v in vertices]
+                box_w = max(xs) - min(xs)
+                box_h = max(ys) - min(ys)
+
+                if box_h < 14 or box_w < 14:
+                    continue  # too small — likely icon text
+                if len(text.strip()) < 2:
+                    continue  # isolated single chars (icons, bullets)
+
+                # Icon detection: small, roughly-square region with short text
+                area = box_w * box_h
+                aspect = box_w / box_h if box_h > 0 else 999
+                word_count = len(text.split())
+                if area < 8000 and word_count <= 2 and 0.4 < aspect < 2.5:
+                    continue  # likely an icon with label text
+
+                regions.append({"text": text, "vertices": vertices})
+
+    return regions
+
+
+# ── Translation ───────────────────────────────────────────────────────────
+
+def translate_texts(texts: list[str], source: str, target: str) -> list[str]:
+    """Translate a list of strings via Google Translate."""
+    if not texts:
+        return []
+    try:
+        translator = GoogleTranslator(source=source, target=target)
+        results = translator.translate_batch(texts)
+        return [r if r else t for r, t in zip(results, texts)]
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Translation error: {exc}")
+
+
+# ── Mask creation (adaptive dilation) ─────────────────────────────────────
+
+def _dilate_mask(arr: np.ndarray, dilation: int) -> np.ndarray:
+    """Dilate a binary mask using OpenCV's fast circular kernel."""
+    if dilation <= 0:
+        return arr
+    import cv2
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation * 2 + 1, dilation * 2 + 1))
+    return cv2.dilate(arr, kernel, iterations=1)
+
+
+def create_mask(image_size: tuple[int, int], regions: list[dict]) -> Image.Image:
+    """Create a binary mask with per-region adaptive dilation."""
+    final_mask = np.zeros((image_size[1], image_size[0]), dtype=np.uint8)
+
+    for r in regions:
+        verts = r["vertices"]
+        ys = [v[1] for v in verts]
+        box_h = max(ys) - min(ys)
+        dilation = max(3, box_h // 6)
+
+        # Draw this region's polygon on a temp mask
+        temp = Image.new("L", image_size, 0)
+        ImageDraw.Draw(temp).polygon(verts, fill=255)
+        temp_arr = np.array(temp)
+
+        # Dilate with region-specific radius
+        temp_arr = _dilate_mask(temp_arr, dilation)
+
+        # OR into final mask
+        final_mask = np.maximum(final_mask, temp_arr)
+
+    return Image.fromarray(final_mask)
+
+
+# ── Inpainting ────────────────────────────────────────────────────────────
+
+def inpaint(image: Image.Image, mask: Image.Image) -> Image.Image:
+    """Remove text using LaMa."""
+    result = lama(image.convert("RGB"), mask.convert("L"))
+    return result
+
+
+# ── Text colour sampling (K-means) ───────────────────────────────────────
+
+def sample_text_color(
+    original: Image.Image,
+    inpainted: Image.Image,
+    vertices: list[tuple[int, int]],
+) -> tuple[tuple[int, int, int], bool]:
+    """Estimate text colour and boldness using K-means clustering.
+
+    Returns (rgb_color, is_bold).
+    """
+    xs = [v[0] for v in vertices]
+    ys = [v[1] for v in vertices]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(original.width, x1), min(original.height, y1)
+
+    orig_crop = np.array(original.crop((x0, y0, x1, y1))).astype(float)
+    inp_crop = np.array(inpainted.crop((x0, y0, x1, y1))).astype(float)
+
+    if orig_crop.size == 0 or orig_crop.shape[0] < 2 or orig_crop.shape[1] < 2:
+        return (0, 0, 0), False
+
+    # Per-pixel diff magnitude
+    diff = np.sqrt(np.sum((orig_crop - inp_crop) ** 2, axis=2))
+    flat_diff = diff.flatten()
+
+    if flat_diff.shape[0] < 4:
+        return (0, 0, 0), False
+
+    try:
+        # K-means with k=2 to separate text pixels (high diff) from background (low diff)
+        km = KMeans(n_clusters=2, n_init=3, random_state=0)
+        labels = km.fit_predict(flat_diff.reshape(-1, 1))
+
+        # The cluster with the higher centroid is the text cluster
+        if km.cluster_centers_[0, 0] > km.cluster_centers_[1, 0]:
+            text_label = 0
+        else:
+            text_label = 1
+
+        # Reshape labels to 2D
+        label_map = labels.reshape(diff.shape)
+        text_mask = label_map == text_label
+
+        # Only use pixels with meaningful diff (skip near-zero diffs)
+        min_diff = max(km.cluster_centers_[:, 0]) * 0.3
+        text_mask = text_mask & (diff > min_diff)
+
+        if not np.any(text_mask):
+            raise ValueError("No text pixels found")
+
+        text_pixels = orig_crop[text_mask]
+        median_color = np.median(text_pixels, axis=0).astype(int)
+
+        # Bold detection: if text pixels occupy a large fraction → bold stroke
+        text_pixel_count = int(np.sum(text_mask))
+        total_pixels = text_mask.size
+        stroke_ratio = text_pixel_count / total_pixels if total_pixels > 0 else 0
+        is_bold = stroke_ratio > 0.35
+
+        return tuple(median_color.tolist()), is_bold
+
+    except Exception:
+        # Fallback: old percentile method
+        threshold = np.percentile(flat_diff, 70)
+        text_mask = diff >= threshold
+        if not np.any(text_mask):
+            return (0, 0, 0), False
+        text_pixels = orig_crop[text_mask]
+        median_color = np.median(text_pixels, axis=0).astype(int)
+        return tuple(median_color.tolist()), False
+
+
+# ── Font selection ────────────────────────────────────────────────────────
+
+CJK_LANGS = {"zh-cn", "zh-tw", "ja", "ko", "zh-CN", "zh-TW"}
+ARABIC_LANGS = {"ar", "fa", "ur"}
+
+
+def get_font(target_lang: str, size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    """Pick the right Noto font for the target language, optionally bold."""
+    if target_lang in CJK_LANGS:
+        candidates = ["NotoSansCJKsc-Regular.otf", "NotoSansCJK-Regular.ttc"]
+    elif target_lang in ARABIC_LANGS:
+        candidates = ["NotoSansArabic-Regular.ttf"]
+    else:
+        candidates = ["NotoSans-Regular.ttf"]
+
+    for name in candidates:
+        path = FONT_DIR / name
+        if path.exists():
+            font = ImageFont.truetype(str(path), size)
+            if bold:
+                try:
+                    font.set_variation_by_name("Bold")
+                except Exception:
+                    pass  # not a variable font or no Bold instance
+            return font
+
+    for fallback in ["arial.ttf", "segoeui.ttf"]:
+        try:
+            font = ImageFont.truetype(fallback, size)
+            return font
+        except OSError:
+            continue
+
+    return ImageFont.load_default()
+
+
+# ── Text rendering helpers (pixel-accurate) ──────────────────────────────
+
+def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+    """Word-based wrapping using Pillow's getbbox for pixel accuracy."""
+    words = text.split()
+    if not words:
+        return [text]
+    lines = []
+    current = ""
+    for word in words:
+        test = (current + " " + word).strip()
+        bbox = font.getbbox(test)
+        w = bbox[2] - bbox[0]
+        if w <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines if lines else [text]
+
+
+def _line_height(font: ImageFont.FreeTypeFont) -> int:
+    """Compute line height from font metrics."""
+    bbox = font.getbbox("Ayg|")
+    return (bbox[3] - bbox[1]) + 2
+
+
+def _fit_font_size(text: str, target_lang: str, box_w: int, box_h: int, bold: bool = False) -> int:
+    """Binary search for the largest font size where text fits the box."""
+    lo, hi = 6, max(box_h, 10)
+    best = lo
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font = get_font(target_lang, mid, bold=bold)
+        lines = _wrap_text(text, font, box_w)
+        lh = _line_height(font)
+        total_h = len(lines) * lh
+        max_line_w = max(
+            (font.getbbox(line)[2] - font.getbbox(line)[0]) for line in lines
+        )
+        if max_line_w <= box_w and total_h <= box_h:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+# ── Text rendering (with centering) ──────────────────────────────────────
+
+def _detect_alignment(x0: int, box_w: int, img_w: int) -> str:
+    """Heuristic alignment detection based on position within the image."""
+    center_x = x0 + box_w / 2
+    relative = center_x / img_w if img_w > 0 else 0.5
+    if relative < 0.4:
+        return "left"
+    elif relative > 0.6:
+        return "right"
+    return "center"
+
+
+def render_text(
+    image: Image.Image,
+    original: Image.Image,
+    inpainted: Image.Image,
+    regions: list[dict],
+    translated: list[str],
+    target_lang: str,
+) -> Image.Image:
+    """Draw translated text with pixel-accurate sizing, alignment, and bold detection."""
+    result = image.copy()
+    draw = ImageDraw.Draw(result)
+
+    for region, text in zip(regions, translated):
+        verts = region["vertices"]
+        xs = [v[0] for v in verts]
+        ys = [v[1] for v in verts]
+        x0, y0 = min(xs), min(ys)
+        x1, y1 = max(xs), max(ys)
+        box_w = x1 - x0
+        box_h = y1 - y0
+
+        if box_w <= 0 or box_h <= 0:
+            continue
+
+        color, is_bold = sample_text_color(original, inpainted, verts)
+        alignment = _detect_alignment(x0, box_w, image.width)
+        font_size = _fit_font_size(text, target_lang, box_w, box_h, bold=is_bold)
+        font = get_font(target_lang, font_size, bold=is_bold)
+        lines = _wrap_text(text, font, box_w)
+        lh = _line_height(font)
+        total_h = len(lines) * lh
+
+        # Vertical centering
+        start_y = y0 + max(0, (box_h - total_h) // 2)
+
+        for line in lines:
+            if start_y + lh > y1 + lh:  # allow slight overflow
+                break
+            line_bbox = font.getbbox(line)
+            line_w = line_bbox[2] - line_bbox[0]
+            # Horizontal alignment
+            if alignment == "left":
+                start_x = x0
+            elif alignment == "right":
+                start_x = x0 + box_w - line_w
+            else:
+                start_x = x0 + max(0, (box_w - line_w) // 2)
+            draw.text((start_x, start_y), line, fill=color, font=font)
+            start_y += lh
+
+    return result
+
+
+# ── Server-side render from layer JSON ────────────────────────────────────
+
+def render_layers_on_image(
+    base_image: Image.Image,
+    layers: list[dict],
+    target_lang: str,
+) -> Image.Image:
+    """Render text layers onto an image (server-side, pixel-accurate)."""
+    # Work in RGBA for opacity support
+    result = base_image.convert("RGBA")
+
+    for layer in layers:
+        text = layer.get("text", "")
+        if not text:
+            continue
+
+        x = int(layer.get("x", 0))
+        y = int(layer.get("y", 0))
+        w = int(layer.get("width", 200))
+        h = int(layer.get("height", 50))
+        font_size = int(layer.get("fontSize", 16))
+        color_hex = layer.get("color", "#000000")
+        opacity = float(layer.get("opacity", 1.0))
+        font_weight = layer.get("fontWeight", "normal")
+        alignment = layer.get("alignment", "center")
+
+        is_bold = font_weight == "bold"
+
+        # Parse hex color
+        color_hex = color_hex.lstrip("#")
+        if len(color_hex) == 6:
+            r, g, b = int(color_hex[0:2], 16), int(color_hex[2:4], 16), int(color_hex[4:6], 16)
+        else:
+            r, g, b = 0, 0, 0
+        alpha = int(opacity * 255)
+
+        font = get_font(target_lang, font_size, bold=is_bold)
+        lines = _wrap_text(text, font, w)
+        lh = _line_height(font)
+        total_h = len(lines) * lh
+
+        # Create transparent overlay for this layer
+        overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+
+        # Vertical centering within the bounding box
+        cy = y + max(0, (h - total_h) // 2)
+
+        for line in lines:
+            line_bbox = font.getbbox(line)
+            line_w = line_bbox[2] - line_bbox[0]
+            if alignment == "left":
+                cx = x
+            elif alignment == "right":
+                cx = x + w - line_w
+            else:
+                cx = x + max(0, (w - line_w) // 2)
+            overlay_draw.text((cx, cy), line, fill=(r, g, b, alpha), font=font)
+            cy += lh
+
+        result = Image.alpha_composite(result, overlay)
+
+    return result.convert("RGB")
+
+
+# ---------------------------------------------------------------------------
+# Helper: PIL Image → base64 data URL
+# ---------------------------------------------------------------------------
+
+def image_to_data_url(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/png;base64,{b64}"
+
+
+def data_url_to_image(data_url: str) -> Image.Image:
+    """Decode a base64 data URL back to a PIL Image."""
+    header, b64_data = data_url.split(",", 1)
+    image_bytes = base64.b64decode(b64_data)
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+async def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/languages")
+async def languages():
+    langs = _get_languages()
+    return JSONResponse(content=langs)
+
+
+# ── Phase 1a: Detect (OCR + translate, no inpainting) ────────────────────
+
+@app.post("/phase1-detect")
+async def phase1_detect(
+    file: UploadFile,
+    source_lang: str = Form("auto"),
+    target_lang: str = Form("en"),
+):
+    """OCR → translate → return original image + detected region boxes."""
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image file.")
+
+    image_bytes = await file.read()
+    try:
+        original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not open image.")
+
+    regions = detect_text(image_bytes)
+    if not regions:
+        return JSONResponse(content={
+            "original": image_to_data_url(original),
+            "width": original.width,
+            "height": original.height,
+            "regions": [],
+        })
+
+    texts = [r["text"] for r in regions]
+    translated = translate_texts(texts, source_lang, target_lang)
+
+    region_data = []
+    for region, orig_text, trans_text in zip(regions, texts, translated):
+        verts = region["vertices"]
+        xs = [v[0] for v in verts]
+        ys = [v[1] for v in verts]
+        x0, y0 = min(xs), min(ys)
+        x1, y1 = max(xs), max(ys)
+        region_data.append({
+            "originalText": orig_text,
+            "translatedText": trans_text,
+            "x": x0, "y": y0,
+            "width": x1 - x0, "height": y1 - y0,
+            "vertices": verts,
+        })
+
+    return JSONResponse(content={
+        "original": image_to_data_url(original),
+        "width": original.width,
+        "height": original.height,
+        "regions": region_data,
+    })
+
+
+# ── Phase 1b: Clean (inpaint user-selected regions only) ────────────────
+
+@app.post("/phase1-clean")
+async def phase1_clean(
+    original_image: str = Form(...),
+    selected_regions: str = Form(...),
+    target_lang: str = Form("en"),
+):
+    """Inpaint only user-selected regions → return clean image + layer metadata."""
+    try:
+        original = data_url_to_image(original_image)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image data.")
+
+    try:
+        sel_regions = json.loads(selected_regions)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid regions JSON.")
+
+    if not sel_regions:
+        return JSONResponse(content={
+            "original": original_image,
+            "clean": original_image,
+            "width": original.width,
+            "height": original.height,
+            "regions": [],
+        })
+
+    # Build mask regions from the selected boxes (convert to vertices format)
+    mask_regions = []
+    for r in sel_regions:
+        x, y, w, h = int(r["x"]), int(r["y"]), int(r["width"]), int(r["height"])
+        verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        mask_regions.append({"vertices": verts})
+
+    # Inpaint only selected areas
+    mask = create_mask(original.size, mask_regions)
+    inpainted = inpaint(original, mask)
+
+    # Build layer metadata
+    layer_data = []
+    for r in sel_regions:
+        x, y = int(r["x"]), int(r["y"])
+        w, h = int(r["width"]), int(r["height"])
+        trans_text = r.get("translatedText", "")
+        orig_text = r.get("originalText", "")
+        if not trans_text or w <= 0 or h <= 0:
+            continue
+
+        verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        color, is_bold = sample_text_color(original, inpainted, verts)
+        alignment = _detect_alignment(x, w, original.width)
+        font_size = _fit_font_size(trans_text, target_lang, w, h, bold=is_bold)
+        hex_color = "#{:02x}{:02x}{:02x}".format(*color)
+
+        layer_data.append({
+            "originalText": orig_text,
+            "translatedText": trans_text,
+            "x": x, "y": y,
+            "width": w, "height": h,
+            "fontSize": font_size,
+            "color": hex_color,
+            "bold": is_bold,
+            "alignment": alignment,
+        })
+
+    return JSONResponse(content={
+        "original": original_image,
+        "clean": image_to_data_url(inpainted),
+        "width": original.width,
+        "height": original.height,
+        "regions": layer_data,
+    })
+
+
+# ── Phase 2: Server-side render ──────────────────────────────────────────
+
+@app.post("/phase2-render")
+async def phase2_render(
+    clean_image: str = Form(...),
+    layers_json: str = Form(...),
+    target_lang: str = Form("en"),
+):
+    """Render text layers onto clean image server-side for pixel-perfect output."""
+    try:
+        base = data_url_to_image(clean_image)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid clean image data.")
+
+    try:
+        layers = json.loads(layers_json)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid layers JSON.")
+
+    result = render_layers_on_image(base, layers, target_lang)
+    return JSONResponse(content={"result": image_to_data_url(result)})
+
+
+# ── Legacy endpoints (kept for backward compat) ──────────────────────────
+
+@app.post("/translate-image")
+async def translate_image(
+    file: UploadFile,
+    source_lang: str = Form("auto"),
+    target_lang: str = Form("en"),
+):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image file.")
+
+    image_bytes = await file.read()
+    try:
+        original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not open image.")
+
+    regions = detect_text(image_bytes)
+    if not regions:
+        buf = io.BytesIO()
+        original.save(buf, format="PNG")
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="image/png")
+
+    texts = [r["text"] for r in regions]
+    translated = translate_texts(texts, source_lang, target_lang)
+    mask = create_mask(original.size, regions)
+    inpainted = inpaint(original, mask)
+    result = render_text(inpainted, original, inpainted, regions, translated, target_lang)
+
+    buf = io.BytesIO()
+    result.save(buf, format="PNG")
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
+
+
+@app.post("/translate-layers")
+async def translate_layers(
+    file: UploadFile,
+    source_lang: str = Form("auto"),
+    target_lang: str = Form("en"),
+):
+    """Legacy: Return inpainted background + text layer metadata for the editor."""
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image file.")
+
+    image_bytes = await file.read()
+    try:
+        original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not open image.")
+
+    regions = detect_text(image_bytes)
+    if not regions:
+        return JSONResponse(content={
+            "background": image_to_data_url(original),
+            "width": original.width,
+            "height": original.height,
+            "layers": [],
+        })
+
+    texts = [r["text"] for r in regions]
+    translated = translate_texts(texts, source_lang, target_lang)
+    mask = create_mask(original.size, regions)
+    inpainted = inpaint(original, mask)
+
+    layers = []
+    for region, orig_text, trans_text in zip(regions, texts, translated):
+        verts = region["vertices"]
+        xs = [v[0] for v in verts]
+        ys = [v[1] for v in verts]
+        x0, y0 = min(xs), min(ys)
+        x1, y1 = max(xs), max(ys)
+        box_w = x1 - x0
+        box_h = y1 - y0
+
+        if box_w <= 0 or box_h <= 0:
+            continue
+
+        color, is_bold = sample_text_color(original, inpainted, verts)
+        alignment = _detect_alignment(x0, box_w, original.width)
+        font_size = _fit_font_size(trans_text, target_lang, box_w, box_h, bold=is_bold)
+        hex_color = "#{:02x}{:02x}{:02x}".format(*color)
+
+        layers.append({
+            "originalText": orig_text,
+            "translatedText": trans_text,
+            "x": x0, "y": y0,
+            "width": box_w, "height": box_h,
+            "fontSize": font_size,
+            "color": hex_color,
+            "bold": is_bold,
+            "alignment": alignment,
+        })
+
+    return JSONResponse(content={
+        "background": image_to_data_url(inpainted),
+        "width": original.width,
+        "height": original.height,
+        "layers": layers,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=5000)

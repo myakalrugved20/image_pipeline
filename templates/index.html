@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Image Text Translator</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
+</head>
+<body>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       STEPPER BAR
+       ═══════════════════════════════════════════════════════════════════ -->
+  <div id="stepper-bar" class="hidden">
+    <div class="stepper">
+      <div class="step" data-step="1"><span class="step-num">1</span> Select Text</div>
+      <div class="step-conn"></div>
+      <div class="step" data-step="2"><span class="step-num">2</span> Review Clean</div>
+      <div class="step-conn"></div>
+      <div class="step" data-step="3"><span class="step-num">3</span> Edit Text</div>
+      <div class="step-conn"></div>
+      <div class="step" data-step="4"><span class="step-num">4</span> Export</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       UPLOAD VIEW
+       ═══════════════════════════════════════════════════════════════════ -->
+  <div id="upload-view" class="container">
+    <h1>Image Text Translator</h1>
+    <p class="subtitle">Upload an image with text &mdash; get it back with the text translated.</p>
+
+    <div class="lang-row">
+      <div class="lang-select">
+        <label for="source-lang">From</label>
+        <select id="source-lang"><option value="auto" selected>Auto Detect</option></select>
+      </div>
+      <span class="arrow">&rarr;</span>
+      <div class="lang-select">
+        <label for="target-lang">To</label>
+        <select id="target-lang"></select>
+      </div>
+    </div>
+
+    <div id="drop-zone" tabindex="0">
+      <div class="drop-icon">&#128444;</div>
+      <p>Drag &amp; drop an image here<br><span class="small">or click to browse</span></p>
+    </div>
+    <input type="file" id="file-input" accept="image/*" hidden />
+
+    <button id="translate-btn" disabled>Detect Text</button>
+
+    <div id="loading" class="hidden">
+      <div class="spinner"></div>
+      <p>Detecting text&hellip; running OCR &amp; translation.</p>
+    </div>
+
+    <div id="error-msg" class="hidden"></div>
+
+    <div id="preview-section" class="hidden">
+      <div class="preview-box">
+        <h3>Original Preview</h3>
+        <img id="original-preview" alt="Original image" />
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       PHASE 1: Select Text Regions
+       ═══════════════════════════════════════════════════════════════════ -->
+  <div id="select-view" class="phase-view hidden">
+    <div class="select-toolbar">
+      <div class="select-toolbar-left">
+        <button id="sel-back" class="tb-btn">&larr; Back</button>
+        <span class="tb-sep"></span>
+        <button id="sel-select-all" class="tb-btn">Select All</button>
+        <button id="sel-deselect-all" class="tb-btn">Deselect All</button>
+        <span class="tb-sep"></span>
+        <button id="sel-draw" class="tb-btn">&#9998; Draw Box</button>
+        <span class="tb-sep"></span>
+        <span class="select-hint">Click boxes to toggle. Draw to add custom regions.</span>
+      </div>
+      <div class="select-toolbar-right">
+        <span id="sel-count" class="tb-label">0 selected</span>
+        <button id="sel-clean" class="tb-btn tb-export">Clean Selected &rarr;</button>
+      </div>
+    </div>
+    <div class="select-workspace" id="select-workspace">
+      <div class="ed-canvas-scroll">
+        <div class="select-canvas-container" id="select-canvas-container">
+          <canvas id="select-canvas"></canvas>
+        </div>
+      </div>
+    </div>
+    <div id="sel-loading" class="hidden" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);z-index:10">
+      <div style="text-align:center">
+        <div class="spinner"></div>
+        <p style="color:#cdd6f4">Cleaning selected regions&hellip;</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       PHASE 2: Review Clean Image
+       ═══════════════════════════════════════════════════════════════════ -->
+  <div id="phase1-view" class="phase-view hidden">
+    <div class="compare-container">
+      <div class="compare-panel">
+        <h3>Original</h3>
+        <div class="compare-img-wrap">
+          <img id="p1-original" alt="Original" />
+        </div>
+      </div>
+      <div class="compare-panel">
+        <h3>Clean (Text Removed)</h3>
+        <div class="compare-img-wrap">
+          <img id="p1-clean" alt="Clean" />
+        </div>
+      </div>
+    </div>
+    <div class="phase-actions">
+      <button id="p1-back" class="action-btn action-secondary">&larr; Back to Selection</button>
+      <span class="phase-info" id="p1-info"></span>
+      <button id="p1-next" class="action-btn action-primary">Next: Edit Text &rarr;</button>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       PHASE 3: Editor
+       ═══════════════════════════════════════════════════════════════════ -->
+  <div id="editor-view" class="hidden">
+    <div class="ed-toolbar">
+      <div class="ed-toolbar-left">
+        <button id="btn-back" class="tb-btn" title="Back to review">&larr; Back</button>
+        <span class="tb-sep"></span>
+        <button id="tool-move" class="tb-btn tb-active" title="Move tool">&#9995; Move</button>
+        <button id="tool-text" class="tb-btn" title="Add text">T+ Text</button>
+        <span class="tb-sep"></span>
+        <button id="btn-zoom-in" class="tb-btn">&#43;</button>
+        <span id="zoom-level" class="tb-label">100%</span>
+        <button id="btn-zoom-out" class="tb-btn">&#8722;</button>
+        <button id="btn-zoom-fit" class="tb-btn">Fit</button>
+      </div>
+      <div class="ed-toolbar-right">
+        <button id="btn-export" class="tb-btn tb-export">Render &amp; Export &rarr;</button>
+      </div>
+    </div>
+
+    <div class="ed-body">
+      <div class="ed-panel ed-panel-left">
+        <div class="panel-section">
+          <h4>Properties</h4>
+          <div id="no-sel" class="hint">Select a text layer</div>
+          <div id="props" class="hidden">
+            <label class="prop-label">Text
+              <textarea id="p-text" rows="3"></textarea>
+            </label>
+            <label class="prop-label">Font Size
+              <div class="slider-row">
+                <input type="range" id="p-size" min="4" max="300" value="24" />
+                <span id="p-size-val">24</span><span class="unit">px</span>
+              </div>
+            </label>
+            <label class="prop-label">Color
+              <input type="color" id="p-color" value="#000000" />
+            </label>
+            <label class="prop-label">Font Family
+              <select id="p-font">
+                <option value="sans-serif">Sans-serif</option>
+                <option value="serif">Serif</option>
+                <option value="monospace">Monospace</option>
+                <option value="Arial">Arial</option>
+                <option value="Georgia">Georgia</option>
+                <option value="Verdana">Verdana</option>
+              </select>
+            </label>
+            <div class="style-row">
+              <button id="p-bold" class="style-btn" title="Bold"><b>B</b></button>
+              <button id="p-italic" class="style-btn" title="Italic"><i>I</i></button>
+              <button id="p-underline" class="style-btn" title="Underline"><u>U</u></button>
+            </div>
+            <label class="prop-label">Opacity
+              <div class="slider-row">
+                <input type="range" id="p-opacity" min="0" max="100" value="100" />
+                <span id="p-opacity-val">100</span><span class="unit">%</span>
+              </div>
+            </label>
+            <label class="prop-label">Position
+              <div class="pos-row">
+                <span>X</span><input type="number" id="p-x" class="pos-input" />
+                <span>Y</span><input type="number" id="p-y" class="pos-input" />
+              </div>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="ed-workspace" id="ed-workspace">
+        <div class="ed-canvas-scroll" id="ed-canvas-scroll">
+          <div class="ed-canvas-container" id="ed-canvas-container">
+            <canvas id="editor-canvas"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <div class="ed-panel ed-panel-right">
+        <div class="panel-section">
+          <h4>Layers</h4>
+          <ul id="layer-list"></ul>
+          <div class="layer-actions">
+            <button id="l-up" class="sm-btn" title="Bring forward">&#9650;</button>
+            <button id="l-down" class="sm-btn" title="Send backward">&#9660;</button>
+            <button id="l-dup" class="sm-btn" title="Duplicate">&#10697;</button>
+            <button id="l-del" class="sm-btn sm-btn-danger" title="Delete">&#128465;</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="ed-statusbar">
+      <span id="status-size"></span>
+      <span id="status-info">Ready</span>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       PHASE 4: Export / Compare
+       ═══════════════════════════════════════════════════════════════════ -->
+  <div id="phase3-view" class="phase-view hidden">
+    <div id="p3-loading" class="hidden" style="text-align:center;padding:3rem">
+      <div class="spinner"></div>
+      <p>Rendering final image on server&hellip;</p>
+    </div>
+    <div id="p3-content" class="hidden">
+      <div class="compare-container">
+        <div class="compare-panel">
+          <h3>Original</h3>
+          <div class="compare-img-wrap">
+            <img id="p3-original" alt="Original" />
+          </div>
+        </div>
+        <div class="compare-panel">
+          <h3>Final Result (Server Rendered)</h3>
+          <div class="compare-img-wrap">
+            <img id="p3-result" alt="Final" />
+          </div>
+        </div>
+      </div>
+      <div class="phase-actions">
+        <button id="p3-back" class="action-btn action-secondary">&larr; Back to Editor</button>
+        <button id="p3-download" class="action-btn action-download">&#11015; Download PNG</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+google-cloud-vision
+google-cloud-translate
+deep-translator
+simple-lama-inpainting
+numpy
+scikit-learn
+jinja2
