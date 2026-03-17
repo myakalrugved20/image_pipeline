@@ -902,9 +902,15 @@ async def phase1_clean(request: Request):
 
         alignment = _detect_alignment(x, w, original.width)
 
-        # For vertical text (~90°), swap w/h for font sizing since text flows along the height
+        # Use actual text-direction dimensions for rotated text
         abs_angle = abs(angle)
-        if 60 < abs_angle < 120:
+        ocr_verts = r.get("vertices")
+        if ocr_verts and len(ocr_verts) >= 4 and abs_angle > 3:
+            # Use polygon edge lengths for true text-direction w/h
+            rot_w, rot_h = _rotated_box_dims(ocr_verts)
+            fit_w = max(rot_w, 10)
+            fit_h = max(rot_h, 10)
+        elif 60 < abs_angle < 120:
             fit_w, fit_h = h, w
         else:
             fit_w, fit_h = w, h
@@ -916,6 +922,8 @@ async def phase1_clean(request: Request):
             "translatedText": trans_text,
             "x": x, "y": y,
             "width": w, "height": h,
+            "fitWidth": fit_w,
+            "fitHeight": fit_h,
             "fontSize": font_size,
             "color": hex_color,
             "bold": is_bold,

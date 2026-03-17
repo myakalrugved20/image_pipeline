@@ -616,19 +616,12 @@ function buildCanvas(data) {
       const fontStack = detectedFont === "sans-serif" ? "sans-serif"
                        : detectedFont + ", sans-serif";
 
-      let boxW = l.width * baseScale;
-      let boxH = l.height * baseScale;
-
-      // For vertical text (~90°), swap width/height since text flows along the height
-      const absAng = Math.abs(ang);
-      if (absAng > 60 && absAng < 120) {
-        const tmp = boxW;
-        boxW = boxH;
-        boxH = tmp;
-      }
+      // Use server-provided text-direction dimensions (accounts for rotation)
+      const fitW = (l.fitWidth || l.width) * baseScale;
+      const fitH = (l.fitHeight || l.height) * baseScale;
 
       const opts = {
-        width:      boxW,
+        width:      fitW,
         fontSize:   l.fontSize * baseScale,
         fill:       l.color,
         fontFamily: fontStack,
@@ -657,17 +650,21 @@ function buildCanvas(data) {
 
       const t = new fabric.Textbox(l.translatedText, opts);
 
-      // Auto-fit: shrink font until text fits within bounding box height
-      let attempts = 0;
-      while (t.height > boxH && t.fontSize > 4 && attempts < 50) {
-        t.set("fontSize", t.fontSize - 1);
+      // Trust server's font size but shrink if browser renders larger
+      t._clearCache();
+      t.initDimensions();
+      let fontSize = t.fontSize;
+      while (t.calcTextHeight() > fitH && fontSize > 4) {
+        fontSize--;
+        t.set("fontSize", fontSize);
+        t._clearCache();
         t.initDimensions();
-        attempts++;
       }
 
       // Vertically center within the bounding box
-      if (t.height < boxH && Math.abs(ang) < 2) {
-        const vOffset = (boxH - t.height) / 2;
+      const textH = t.calcTextHeight();
+      if (textH < fitH && Math.abs(ang) < 2) {
+        const vOffset = (fitH - textH) / 2;
         t.set("top", t.top + vOffset);
       }
 
