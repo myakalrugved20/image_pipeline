@@ -39,6 +39,8 @@ BASE_DIR = Path(__file__).resolve().parent
 FONT_DIR = BASE_DIR / "fonts"
 
 app = FastAPI(title="Image Text Translator")
+app.state.max_request_size = 50 * 1024 * 1024  # 50MB
+
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
@@ -816,21 +818,26 @@ async def phase1_detect(
 # ── Phase 1b: Clean (inpaint user-selected regions only) ────────────────
 
 @app.post("/phase1-clean")
-async def phase1_clean(
-    original_image: str = Form(...),
-    selected_regions: str = Form(...),
-    target_lang: str = Form("en"),
-):
+async def phase1_clean(request: Request):
+    form = await request.form()
+    original_image = form.get("original_image", "")
+    selected_regions = form.get("selected_regions", "")
+    target_lang = form.get("target_lang", "en")
     """Inpaint only user-selected regions → return clean image + layer metadata."""
+    import logging
+    logger = logging.getLogger(__name__)
+
     try:
         original = data_url_to_image(original_image)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image data.")
+    except Exception as e:
+        logger.error(f"phase1-clean: Invalid image data: {e}, data length: {len(original_image) if original_image else 0}")
+        raise HTTPException(status_code=400, detail=f"Invalid image data: {e}")
 
     try:
         sel_regions = json.loads(selected_regions)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid regions JSON.")
+    except Exception as e:
+        logger.error(f"phase1-clean: Invalid regions JSON: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid regions JSON: {e}")
 
     if not sel_regions:
         return JSONResponse(content={
@@ -938,12 +945,13 @@ async def phase1_clean(
 # ── Phase 2: Server-side render ──────────────────────────────────────────
 
 @app.post("/phase2-render")
-async def phase2_render(
-    clean_image: str = Form(...),
-    layers_json: str = Form(...),
-    target_lang: str = Form("en"),
-):
+async def phase2_render(request: Request):
     """Render text layers onto clean image server-side for pixel-perfect output."""
+    form = await request.form()
+    clean_image = form.get("clean_image", "")
+    layers_json = form.get("layers_json", "")
+    target_lang = form.get("target_lang", "en")
+
     try:
         base = data_url_to_image(clean_image)
     except Exception:
