@@ -518,12 +518,15 @@ selClean.addEventListener("click", async () => {
   selLoading.classList.remove("hidden");
 
   try {
-    const fd = new FormData();
-    fd.append("original_image", detectData.original);
-    fd.append("selected_regions", JSON.stringify(selectedRegions));
-    fd.append("target_lang", targetLang.value);
-
-    const res = await fetch("/phase1-clean", { method: "POST", body: fd });
+    const res = await fetch("/phase1-clean", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        original_image: detectData.original,
+        selected_regions: selectedRegions,
+        target_lang: targetLang.value,
+      }),
+    });
     if (!res.ok) {
       const e = await res.json().catch(() => ({ detail: "Unknown error" }));
       throw new Error(e.detail || `Server ${res.status}`);

@@ -819,25 +819,18 @@ async def phase1_detect(
 
 @app.post("/phase1-clean")
 async def phase1_clean(request: Request):
-    form = await request.form()
-    original_image = form.get("original_image", "")
-    selected_regions = form.get("selected_regions", "")
-    target_lang = form.get("target_lang", "en")
     """Inpaint only user-selected regions → return clean image + layer metadata."""
-    import logging
-    logger = logging.getLogger(__name__)
+    body = await request.json()
+    original_image = body.get("original_image", "")
+    selected_regions = body.get("selected_regions", [])
+    target_lang = body.get("target_lang", "en")
 
     try:
         original = data_url_to_image(original_image)
     except Exception as e:
-        logger.error(f"phase1-clean: Invalid image data: {e}, data length: {len(original_image) if original_image else 0}")
         raise HTTPException(status_code=400, detail=f"Invalid image data: {e}")
 
-    try:
-        sel_regions = json.loads(selected_regions)
-    except Exception as e:
-        logger.error(f"phase1-clean: Invalid regions JSON: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid regions JSON: {e}")
+    sel_regions = selected_regions
 
     if not sel_regions:
         return JSONResponse(content={
