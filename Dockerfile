@@ -20,6 +20,7 @@ COPY . .
 RUN python download_fonts.py
 
 # HF Spaces expects port 7860
+ENV PORT=7860
 EXPOSE 7860
 
 CMD ["python", "app.py"]
