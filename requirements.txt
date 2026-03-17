@@ -8,4 +8,6 @@ deep-translator
 simple-lama-inpainting
 numpy
 scikit-learn
+scipy
+opencv-python-headless
 jinja2

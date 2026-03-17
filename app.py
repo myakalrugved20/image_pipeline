@@ -9,8 +9,12 @@ from pathlib import Path
 #   gcloud auth application-default login
 # to authenticate with your Google account.
 
+import math
+
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from scipy import stats
 from fastapi import FastAPI, UploadFile, Form, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +27,14 @@ from sklearn.cluster import KMeans
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
+
+# Support Google credentials from environment (for Docker/HF Spaces)
+_creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+if _creds_json and not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+    _creds_path = Path("/tmp/gcloud_creds.json")
+    _creds_path.write_text(_creds_json)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(_creds_path)
+
 BASE_DIR = Path(__file__).resolve().parent
 FONT_DIR = BASE_DIR / "fonts"
 
@@ -132,7 +144,6 @@ def _dilate_mask(arr: np.ndarray, dilation: int) -> np.ndarray:
     """Dilate a binary mask using OpenCV's fast circular kernel."""
     if dilation <= 0:
         return arr
-    import cv2
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation * 2 + 1, dilation * 2 + 1))
     return cv2.dilate(arr, kernel, iterations=1)
 
@@ -243,20 +254,184 @@ def sample_text_color(
         return tuple(median_color.tolist()), False
 
 
+# ── Style detection (italic, underline, font family) ─────────────────────
+
+def detect_italic(
+    original: Image.Image,
+    inpainted: Image.Image,
+    vertices: list[tuple[int, int]],
+) -> bool:
+    """Detect italic text by measuring the slant of text pixel centroids."""
+    xs = [v[0] for v in vertices]
+    ys = [v[1] for v in vertices]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(original.width, x1), min(original.height, y1)
+
+    orig_crop = np.array(original.crop((x0, y0, x1, y1))).astype(float)
+    inp_crop = np.array(inpainted.crop((x0, y0, x1, y1))).astype(float)
+
+    if orig_crop.size == 0 or orig_crop.shape[0] < 4 or orig_crop.shape[1] < 4:
+        return False
+
+    diff = np.sqrt(np.sum((orig_crop - inp_crop) ** 2, axis=2))
+    threshold = np.percentile(diff.flatten(), 70)
+    text_mask = diff >= threshold
+
+    # For each row, compute the centroid (avg x) of text pixels
+    row_indices = []
+    centroids = []
+    for row_i in range(text_mask.shape[0]):
+        cols = np.where(text_mask[row_i])[0]
+        if len(cols) >= 3:
+            row_indices.append(row_i)
+            centroids.append(np.mean(cols))
+
+    if len(row_indices) < 5:
+        return False
+
+    # Linear regression: if slope is significant, text is slanted (italic)
+    slope, _, r_value, _, _ = stats.linregress(row_indices, centroids)
+    # Italic text has a consistent rightward slant with good correlation
+    return abs(slope) > 0.12 and abs(r_value) > 0.5
+
+
+def detect_font_family(
+    original: Image.Image,
+    vertices: list[tuple[int, int]],
+) -> str:
+    """Detect serif vs sans-serif using edge frequency analysis."""
+    xs = [v[0] for v in vertices]
+    ys = [v[1] for v in vertices]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(original.width, x1), min(original.height, y1)
+
+    crop = np.array(original.crop((x0, y0, x1, y1)).convert("L"))
+    if crop.size == 0 or crop.shape[0] < 4 or crop.shape[1] < 4:
+        return "sans-serif"
+
+    # Binarize to find text pixels
+    _, binary = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    text_pixel_count = np.sum(binary > 0)
+    if text_pixel_count < 20:
+        return "sans-serif"
+
+    # Horizontal Sobel → detects vertical edges (serifs create many fine edges)
+    sobel_h = cv2.Sobel(crop, cv2.CV_64F, 1, 0, ksize=3)
+    # Only count edges on text pixels
+    edge_on_text = np.abs(sobel_h) * (binary > 0)
+    edge_count = np.sum(edge_on_text > 30)
+
+    ratio = edge_count / text_pixel_count if text_pixel_count > 0 else 0
+    return "serif" if ratio > 0.45 else "sans-serif"
+
+
+def detect_underline(
+    original: Image.Image,
+    inpainted: Image.Image,
+    vertices: list[tuple[int, int]],
+) -> bool:
+    """Detect underline by looking for a horizontal line in the bottom portion."""
+    xs = [v[0] for v in vertices]
+    ys = [v[1] for v in vertices]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(original.width, x1), min(original.height, y1)
+    box_w = x1 - x0
+    box_h = y1 - y0
+
+    if box_w < 10 or box_h < 10:
+        return False
+
+    orig_crop = np.array(original.crop((x0, y0, x1, y1))).astype(float)
+    inp_crop = np.array(inpainted.crop((x0, y0, x1, y1))).astype(float)
+
+    diff = np.sqrt(np.sum((orig_crop - inp_crop) ** 2, axis=2))
+
+    # Look at bottom 25% of the box
+    bottom_start = int(box_h * 0.75)
+    bottom_region = diff[bottom_start:, :]
+
+    if bottom_region.size == 0:
+        return False
+
+    threshold = np.percentile(diff.flatten(), 60)
+
+    # Check each row for a long horizontal run of changed pixels
+    for row in bottom_region:
+        run = np.sum(row >= threshold)
+        if run > box_w * 0.6:
+            return True
+
+    return False
+
+
+def analyze_text_style(
+    original: Image.Image,
+    inpainted: Image.Image,
+    vertices: list[tuple[int, int]],
+) -> dict:
+    """Comprehensive text style analysis: color, bold, italic, underline, font family."""
+    color, is_bold = sample_text_color(original, inpainted, vertices)
+    is_italic = detect_italic(original, inpainted, vertices)
+    is_underline = detect_underline(original, inpainted, vertices)
+    font_family = detect_font_family(original, vertices)
+
+    return {
+        "color": color,
+        "is_bold": is_bold,
+        "is_italic": is_italic,
+        "is_underline": is_underline,
+        "font_family": font_family,
+    }
+
+
 # ── Font selection ────────────────────────────────────────────────────────
 
 CJK_LANGS = {"zh-cn", "zh-tw", "ja", "ko", "zh-CN", "zh-TW"}
 ARABIC_LANGS = {"ar", "fa", "ur"}
 
+# Map CSS font-family values to Noto font files
+FONT_FAMILY_MAP = {
+    "sans-serif": "NotoSans-Regular.ttf",
+    "Arial":      "NotoSans-Regular.ttf",
+    "Verdana":    "NotoSans-Regular.ttf",
+    "serif":      "NotoSerif-Regular.ttf",
+    "Georgia":    "NotoSerif-Regular.ttf",
+    "monospace":  "NotoSansMono-Regular.ttf",
+}
 
-def get_font(target_lang: str, size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    """Pick the right Noto font for the target language, optionally bold."""
+ITALIC_FONT_MAP = {
+    "sans-serif": "NotoSans-Italic.ttf",
+    "Arial":      "NotoSans-Italic.ttf",
+    "Verdana":    "NotoSans-Italic.ttf",
+    # Serif/mono italic not available — fall back to regular
+}
+
+
+def get_font(
+    target_lang: str,
+    size: int,
+    bold: bool = False,
+    italic: bool = False,
+    font_family: str = "sans-serif",
+) -> ImageFont.FreeTypeFont:
+    """Pick the right Noto font for the target language and style."""
     if target_lang in CJK_LANGS:
         candidates = ["NotoSansCJKsc-Regular.otf", "NotoSansCJK-Regular.ttc"]
     elif target_lang in ARABIC_LANGS:
         candidates = ["NotoSansArabic-Regular.ttf"]
     else:
-        candidates = ["NotoSans-Regular.ttf"]
+        # Try italic variant first if requested
+        if italic and font_family in ITALIC_FONT_MAP:
+            italic_name = ITALIC_FONT_MAP[font_family]
+            if (FONT_DIR / italic_name).exists():
+                candidates = [italic_name]
+            else:
+                candidates = [FONT_FAMILY_MAP.get(font_family, "NotoSans-Regular.ttf")]
+        else:
+            candidates = [FONT_FAMILY_MAP.get(font_family, "NotoSans-Regular.ttf")]
 
     for name in candidates:
         path = FONT_DIR / name
@@ -266,7 +441,7 @@ def get_font(target_lang: str, size: int, bold: bool = False) -> ImageFont.FreeT
                 try:
                     font.set_variation_by_name("Bold")
                 except Exception:
-                    pass  # not a variable font or no Bold instance
+                    pass
             return font
 
     for fallback in ["arial.ttf", "segoeui.ttf"]:
@@ -331,8 +506,6 @@ def _fit_font_size(text: str, target_lang: str, box_w: int, box_h: int, bold: bo
 
 
 # ── Text rendering (with centering) ──────────────────────────────────────
-
-import math
 
 def _calc_rotation(vertices: list) -> float:
     """Calculate rotation angle (degrees) from OCR polygon vertices.
@@ -461,10 +634,14 @@ def render_layers_on_image(
         color_hex = layer.get("color", "#000000")
         opacity = float(layer.get("opacity", 1.0))
         font_weight = layer.get("fontWeight", "normal")
+        font_style = layer.get("fontStyle", "normal")
+        font_family = layer.get("fontFamily", "sans-serif")
+        underline = layer.get("underline", False)
         alignment = layer.get("alignment", "center")
         angle = float(layer.get("angle", 0))
 
         is_bold = font_weight == "bold"
+        is_italic = font_style == "italic"
 
         # Parse hex color
         color_hex = color_hex.lstrip("#")
@@ -474,8 +651,12 @@ def render_layers_on_image(
             r, g, b = 0, 0, 0
         alpha = int(opacity * 255)
 
-        font = get_font(target_lang, font_size, bold=is_bold)
-        lines = _wrap_text(text, font, w)
+        font = get_font(target_lang, font_size, bold=is_bold, italic=is_italic, font_family=font_family)
+        # If text contains newlines, it was pre-wrapped by the editor — use as-is
+        if "\n" in text:
+            lines = text.split("\n")
+        else:
+            lines = _wrap_text(text, font, w)
         lh = _line_height(font)
         total_h = len(lines) * lh
         # Actual max line width (may exceed bounding box w with server fonts)
@@ -498,6 +679,13 @@ def render_layers_on_image(
                 else:
                     cx = x + max(0, (w - line_w) // 2)
                 overlay_draw.text((cx, cy), line, fill=(r, g, b, alpha), font=font)
+                if underline:
+                    ul_y = cy + lh - 2
+                    ul_thick = max(1, font_size // 14)
+                    overlay_draw.line(
+                        [(cx, ul_y), (cx + line_w, ul_y)],
+                        fill=(r, g, b, alpha), width=ul_thick,
+                    )
                 cy += lh
             result = Image.alpha_composite(result, overlay)
         else:
@@ -518,6 +706,13 @@ def render_layers_on_image(
                 else:
                     cx = pad + max(0, (actual_w - line_w) // 2)
                 txt_draw.text((cx, cy), line, fill=(r, g, b, alpha), font=font)
+                if underline:
+                    ul_y = cy + lh - 2
+                    ul_thick = max(1, font_size // 14)
+                    txt_draw.line(
+                        [(cx, ul_y), (cx + line_w, ul_y)],
+                        fill=(r, g, b, alpha), width=ul_thick,
+                    )
                 cy += lh
             # Rotate around center (negative because Pillow rotates CCW)
             rotated = txt_img.rotate(-angle, resample=Image.BICUBIC, expand=True)
@@ -683,7 +878,16 @@ async def phase1_clean(
         # position, color sampling, font sizing
         # The angle handles the visual rotation in the editor
         sample_verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-        color, is_bold = sample_text_color(original, inpainted, sample_verts)
+        style = analyze_text_style(original, inpainted, sample_verts)
+        color = style["color"]
+        is_bold = bool(style["is_bold"])
+        is_italic = bool(style["is_italic"])
+        is_underline = bool(style["is_underline"])
+        font_family = str(style["font_family"])
+
+        # Disable underline for rotated text (false positive from diagonal pixels)
+        if abs(angle) > 5:
+            is_underline = False
 
         # Check if detected color is too close to background
         brightness = (color[0] * 299 + color[1] * 587 + color[2] * 114) / 1000
@@ -697,7 +901,14 @@ async def phase1_clean(
                 color = (255, 255, 255) if bg_brightness < 128 else (0, 0, 0)
 
         alignment = _detect_alignment(x, w, original.width)
-        font_size = _fit_font_size(trans_text, target_lang, w, h, bold=is_bold)
+
+        # For vertical text (~90°), swap w/h for font sizing since text flows along the height
+        abs_angle = abs(angle)
+        if 60 < abs_angle < 120:
+            fit_w, fit_h = h, w
+        else:
+            fit_w, fit_h = w, h
+        font_size = _fit_font_size(trans_text, target_lang, fit_w, fit_h, bold=is_bold)
         hex_color = "#{:02x}{:02x}{:02x}".format(*color)
 
         layer_data.append({
@@ -708,6 +919,9 @@ async def phase1_clean(
             "fontSize": font_size,
             "color": hex_color,
             "bold": is_bold,
+            "italic": is_italic,
+            "underline": is_underline,
+            "fontFamily": font_family,
             "alignment": alignment,
             "angle": angle,
         })
@@ -852,4 +1066,6 @@ async def translate_layers(
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    host = "0.0.0.0" if os.environ.get("SPACE_ID") else "127.0.0.1"
+    uvicorn.run(app, host=host, port=port)

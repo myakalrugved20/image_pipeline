@@ -86,6 +86,9 @@ const statusSize   = document.getElementById("status-size");
 const statusInfo   = document.getElementById("status-info");
 const workspace    = document.getElementById("ed-workspace");
 const canvasCont   = document.getElementById("ed-canvas-container");
+const btnTogglePreview = document.getElementById("btn-toggle-preview");
+const edPreviewPanel   = document.getElementById("ed-preview-panel");
+const edPreviewImg     = document.getElementById("ed-preview-img");
 
 // DOM — Export (Phase 4)
 const phase3View   = document.getElementById("phase3-view");
@@ -567,6 +570,11 @@ function buildCanvas(data) {
   imgH = data.height;
   statusSize.textContent = `${imgW} x ${imgH} px`;
 
+  // Set original image in preview panel
+  if (phaseData && phaseData.original) {
+    edPreviewImg.src = phaseData.original;
+  }
+
   requestAnimationFrame(() => {
     const wsW = workspace.clientWidth - 80;
     const wsH = workspace.clientHeight - 80;
@@ -597,35 +605,69 @@ function buildCanvas(data) {
       fc.setBackgroundImage(img, fc.renderAll.bind(fc));
     }, { crossOrigin: "anonymous" });
 
-    // Text layers
+    // Text layers — use Textbox with fixed width, auto-fit font to fill bounding box
     data.layers.forEach(l => {
       const ang = l.angle || 0;
+      const alignment = l.alignment || "center";
+      const detectedFont = l.fontFamily || "sans-serif";
+      const fontStack = detectedFont === "sans-serif" ? "sans-serif"
+                       : detectedFont + ", sans-serif";
+
+      let boxW = l.width * baseScale;
+      let boxH = l.height * baseScale;
+
+      // For vertical text (~90°), swap width/height since text flows along the height
+      const absAng = Math.abs(ang);
+      if (absAng > 60 && absAng < 120) {
+        const tmp = boxW;
+        boxW = boxH;
+        boxH = tmp;
+      }
+
       const opts = {
+        width:      boxW,
         fontSize:   l.fontSize * baseScale,
         fill:       l.color,
-        fontFamily: "sans-serif",
+        fontFamily: fontStack,
         fontWeight: l.bold ? "bold" : "normal",
-        fontStyle:  "normal",
-        underline:  false,
+        fontStyle:  l.italic ? "italic" : "normal",
+        underline:  !!l.underline,
+        textAlign:  alignment,
         editable:   true,
         opacity:    1,
         angle:      ang,
         _name:      l.translatedText.substring(0, 28),
         _boxW:      l.width,
         _boxH:      l.height,
-        _alignment: l.alignment || "center",
+        _alignment: alignment,
+        left:       l.x * baseScale,
+        top:        l.y * baseScale,
       };
+
       // For rotated text, position from center of bounding box
       if (Math.abs(ang) > 1) {
         opts.originX = "center";
         opts.originY = "center";
         opts.left = (l.x + l.width / 2) * baseScale;
         opts.top  = (l.y + l.height / 2) * baseScale;
-      } else {
-        opts.left = l.x * baseScale;
-        opts.top  = l.y * baseScale;
       }
-      const t = new fabric.IText(l.translatedText, opts);
+
+      const t = new fabric.Textbox(l.translatedText, opts);
+
+      // Auto-fit: shrink font until text fits within bounding box height
+      let attempts = 0;
+      while (t.height > boxH && t.fontSize > 4 && attempts < 50) {
+        t.set("fontSize", t.fontSize - 1);
+        t.initDimensions();
+        attempts++;
+      }
+
+      // Vertically center within the bounding box
+      if (t.height < boxH && Math.abs(ang) < 2) {
+        const vOffset = (boxH - t.height) / 2;
+        t.set("top", t.top + vOffset);
+      }
+
       fc.add(t);
     });
 
@@ -650,7 +692,7 @@ function buildCanvas(data) {
 // ── Selection ────────────────────────────────────────────────────────────
 function onSel() {
   const o = fc.getActiveObject();
-  if (!o || o.type !== "i-text") { onDesel(); return; }
+  if (!o || o.type !== "i-text" && o.type !== "textbox") { onDesel(); return; }
   syncProps(o); noSel.classList.add("hidden"); propsDiv.classList.remove("hidden");
   highlightLayer(o);
 }
@@ -717,13 +759,13 @@ pOpacity.addEventListener("input", () => {
 pX.addEventListener("change", () => { const o = active(); if (!o) return; o.set("left", parseInt(pX.value, 10) * baseScale); fc.renderAll(); });
 pY.addEventListener("change", () => { const o = active(); if (!o) return; o.set("top", parseInt(pY.value, 10) * baseScale); fc.renderAll(); });
 
-function active() { const o = fc ? fc.getActiveObject() : null; return (o && o.type === "i-text") ? o : null; }
+function active() { const o = fc ? fc.getActiveObject() : null; return (o && (o.type === "i-text" || o.type === "textbox")) ? o : null; }
 
 // ── Layer list ───────────────────────────────────────────────────────────
 function refreshLayers() {
   layerListEl.innerHTML = "";
   if (!fc) return;
-  const objs = fc.getObjects().filter(o => o.type === "i-text");
+  const objs = fc.getObjects().filter(o => (o.type === "i-text" || o.type === "textbox"));
   for (let i = objs.length - 1; i >= 0; i--) {
     const o = objs[i];
     const li = document.createElement("li");
@@ -742,7 +784,7 @@ function refreshLayers() {
 function highlightLayer(obj) {
   layerListEl.querySelectorAll("li").forEach(li => li.classList.remove("active"));
   if (!obj || !fc) return;
-  const objs = fc.getObjects().filter(o => o.type === "i-text");
+  const objs = fc.getObjects().filter(o => (o.type === "i-text" || o.type === "textbox"));
   const idx = objs.indexOf(obj);
   layerListEl.querySelectorAll("li").forEach(li => {
     if (parseInt(li.dataset.idx) === idx) li.classList.add("active");
@@ -763,6 +805,11 @@ lDel.addEventListener("click", () => {
 // ── Toolbar ──────────────────────────────────────────────────────────────
 btnBack.addEventListener("click", () => setPhase("review"));
 
+btnTogglePreview.addEventListener("click", () => {
+  edPreviewPanel.classList.toggle("hidden");
+  btnTogglePreview.classList.toggle("tb-active");
+});
+
 toolMove.addEventListener("click", () => setTool("move"));
 toolText.addEventListener("click", () => setTool("text"));
 
@@ -771,8 +818,9 @@ function setTool(t) {
   toolMove.classList.toggle("tb-active", t === "move");
   toolText.classList.toggle("tb-active", t === "text");
   if (t === "text") {
-    const nt = new fabric.IText("New Text", {
-      left: (fc.width / 2) - 40, top: (fc.height / 2) - 12,
+    const nt = new fabric.Textbox("New Text", {
+      left: (fc.width / 2) - 80, top: (fc.height / 2) - 12,
+      width: 160 * baseScale,
       fontSize: 24 * baseScale, fill: "#ffffff", fontFamily: "sans-serif",
       editable: true, _name: "New Text",
     });
@@ -808,60 +856,25 @@ workspace.addEventListener("wheel", e => {
 // ══════════════════════════════════════════════════════════════════════════
 // Export → Phase 4 (server-side render)
 // ══════════════════════════════════════════════════════════════════════════
-btnExport.addEventListener("click", async () => {
+btnExport.addEventListener("click", () => {
   if (!fc || !phaseData) return;
 
   fc.discardActiveObject(); fc.renderAll();
 
-  // Collect layer data from Fabric canvas → original image coordinates
-  const layers = fc.getObjects().filter(o => o.type === "i-text").map(o => {
-    const w = Math.round((o.width * o.scaleX) / baseScale);
-    const h = Math.round((o.height * o.scaleY) / baseScale);
-    let lx = Math.round(o.left / baseScale);
-    let ly = Math.round(o.top / baseScale);
-    // If object uses center origin (rotated text), convert to top-left
-    if (o.originX === "center") lx = lx - Math.round(w / 2);
-    if (o.originY === "center") ly = ly - Math.round(h / 2);
-    return {
-      text:       o.text,
-      x:          lx,
-      y:          ly,
-      width:      w,
-      height:     h,
-      fontSize:   Math.round(o.fontSize * o.scaleY / baseScale),
-      color:      rgbToHex(o.fill),
-      fontFamily: o.fontFamily || "sans-serif",
-      fontWeight: o.fontWeight || "normal",
-      fontStyle:  o.fontStyle || "normal",
-      opacity:    o.opacity != null ? o.opacity : 1,
-      alignment:  o._alignment || "center",
-      angle:      o.angle || 0,
-    };
-  });
-
-  // Switch to export phase with loading state
+  // Switch to export phase
   setPhase("export");
   p3Loading.classList.remove("hidden");
   p3Content.classList.add("hidden");
 
-  try {
-    const fd = new FormData();
-    fd.append("clean_image", phaseData.clean);
-    fd.append("layers_json", JSON.stringify(layers));
-    fd.append("target_lang", targetLang.value);
+  // Render canvas at full original resolution (client-side)
+  // This guarantees the output matches the editor exactly
+  const multiplier = 1 / (baseScale * zoomLevel);
+  const dataUrl = fc.toDataURL({ format: "png", multiplier: multiplier });
 
-    const res = await fetch("/phase2-render", { method: "POST", body: fd });
-    if (!res.ok) throw new Error("Server render failed");
-    const data = await res.json();
-
-    p3Original.src = phaseData.original;
-    p3Result.src = data.result;
-    p3Loading.classList.add("hidden");
-    p3Content.classList.remove("hidden");
-  } catch (e) {
-    showErr(e.message);
-    setPhase("editor");
-  }
+  p3Original.src = phaseData.original;
+  p3Result.src = dataUrl;
+  p3Loading.classList.add("hidden");
+  p3Content.classList.remove("hidden");
 });
 
 // ══════════════════════════════════════════════════════════════════════════

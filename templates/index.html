@@ -138,6 +138,8 @@
         <button id="tool-move" class="tb-btn tb-active" title="Move tool">&#9995; Move</button>
         <button id="tool-text" class="tb-btn" title="Add text">T+ Text</button>
         <span class="tb-sep"></span>
+        <button id="btn-toggle-preview" class="tb-btn" title="Toggle original preview">&#128065; Original</button>
+        <span class="tb-sep"></span>
         <button id="btn-zoom-in" class="tb-btn">&#43;</button>
         <span id="zoom-level" class="tb-label">100%</span>
         <button id="btn-zoom-out" class="tb-btn">&#8722;</button>
@@ -193,6 +195,15 @@
                 <span>Y</span><input type="number" id="p-y" class="pos-input" />
               </div>
             </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="ed-preview-panel hidden" id="ed-preview-panel">
+        <div class="panel-section">
+          <h4>Original Image</h4>
+          <div class="ed-preview-wrap">
+            <img id="ed-preview-img" alt="Original" />
           </div>
         </div>
       </div>

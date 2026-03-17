@@ -9,6 +9,15 @@ FONTS = {
     "NotoSans-Regular.ttf": (
         "https://github.com/google/fonts/raw/main/ofl/notosans/NotoSans%5Bwdth%2Cwght%5D.ttf"
     ),
+    "NotoSans-Italic.ttf": (
+        "https://github.com/google/fonts/raw/main/ofl/notosans/NotoSans-Italic%5Bwdth%2Cwght%5D.ttf"
+    ),
+    "NotoSerif-Regular.ttf": (
+        "https://github.com/google/fonts/raw/main/ofl/notoserif/NotoSerif%5Bwdth%2Cwght%5D.ttf"
+    ),
+    "NotoSansMono-Regular.ttf": (
+        "https://github.com/google/fonts/raw/main/ofl/notosansmono/NotoSansMono%5Bwdth%2Cwght%5D.ttf"
+    ),
     "NotoSansArabic-Regular.ttf": (
         "https://github.com/google/fonts/raw/main/ofl/notosansarabic/NotoSansArabic%5Bwdth%2Cwght%5D.ttf"
     ),
