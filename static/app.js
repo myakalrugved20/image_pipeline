@@ -14,6 +14,9 @@ let appPhase      = "upload";   // "upload" | "select" | "review" | "editor" | "
 let detectData    = null;       // Stores /phase1-detect response
 let phaseData     = null;       // Stores /phase1-clean response
 let drawMode      = false;
+let cleanupMode   = false;
+let cleanupFc     = null;
+let cleanupScale  = 1;
 
 // ══════════════════════════════════════════════════════════════════════════
 // DOM — Upload
@@ -52,6 +55,12 @@ const p1Clean      = document.getElementById("p1-clean");
 const p1Back       = document.getElementById("p1-back");
 const p1Next       = document.getElementById("p1-next");
 const p1Info       = document.getElementById("p1-info");
+const p1CleanWrap      = document.getElementById("p1-clean-wrap");
+const p1CleanupCanvas  = document.getElementById("p1-cleanup-canvas");
+const p1CleanupToggle  = document.getElementById("p1-cleanup-toggle");
+const p1ApplyCleanup   = document.getElementById("p1-apply-cleanup");
+const p1ClearBoxes     = document.getElementById("p1-clear-boxes");
+const p1CleanupLoading = document.getElementById("p1-cleanup-loading");
 
 // DOM — Editor (Phase 3)
 const editorView   = document.getElementById("editor-view");
@@ -78,6 +87,11 @@ const pOpacityVal  = document.getElementById("p-opacity-val");
 const pX           = document.getElementById("p-x");
 const pY           = document.getElementById("p-y");
 const layerListEl  = document.getElementById("layer-list");
+
+// Track the last editing textbox and its selection (survives button clicks)
+var _lastEditObj = null;
+var _lastSelStart = 0;
+var _lastSelEnd = 0;
 const lUp          = document.getElementById("l-up");
 const lDown        = document.getElementById("l-down");
 const lDup         = document.getElementById("l-dup");
@@ -85,6 +99,7 @@ const lDel         = document.getElementById("l-del");
 const statusSize   = document.getElementById("status-size");
 const statusInfo   = document.getElementById("status-info");
 const workspace    = document.getElementById("ed-workspace");
+const scrollCont   = document.getElementById("ed-canvas-scroll");
 const canvasCont   = document.getElementById("ed-canvas-container");
 const btnTogglePreview = document.getElementById("btn-toggle-preview");
 const edPreviewPanel   = document.getElementById("ed-preview-panel");
@@ -98,6 +113,7 @@ const p3Original   = document.getElementById("p3-original");
 const p3Result     = document.getElementById("p3-result");
 const p3Back       = document.getElementById("p3-back");
 const p3Download   = document.getElementById("p3-download");
+const p3DownClean  = document.getElementById("p3-download-clean");
 
 // ══════════════════════════════════════════════════════════════════════════
 // Phase state machine
@@ -525,6 +541,7 @@ selClean.addEventListener("click", async () => {
         original_image: detectData.original,
         selected_regions: selectedRegions,
         target_lang: targetLang.value,
+        mask_mode: document.getElementById("mask-mode").value,
       }),
     });
     if (!res.ok) {
@@ -543,15 +560,178 @@ selClean.addEventListener("click", async () => {
 // ══════════════════════════════════════════════════════════════════════════
 // PHASE 2: Review Clean
 // ══════════════════════════════════════════════════════════════════════════
+function exitCleanupMode() {
+  cleanupMode = false;
+  if (cleanupFc) { cleanupFc.dispose(); cleanupFc = null; }
+  p1CleanupCanvas.classList.add("hidden");
+  p1Clean.classList.remove("hidden");
+  p1CleanupToggle.textContent = "\u270E Manual Cleanup";
+  p1ApplyCleanup.classList.add("hidden");
+  p1ClearBoxes.classList.add("hidden");
+}
+
+function enterCleanupMode() {
+  cleanupMode = true;
+  p1CleanupToggle.textContent = "Cancel Cleanup";
+  p1ApplyCleanup.classList.remove("hidden");
+  p1ClearBoxes.classList.remove("hidden");
+
+  // Size canvas to match the displayed clean image
+  const wrapW = p1CleanWrap.clientWidth;
+  const wrapH = p1CleanWrap.clientHeight;
+  const iw = phaseData.width, ih = phaseData.height;
+  const scale = Math.min(wrapW / iw, wrapH / ih, 1);
+  cleanupScale = scale;
+  const dw = Math.round(iw * scale);
+  const dh = Math.round(ih * scale);
+
+  p1Clean.classList.add("hidden");
+  p1CleanupCanvas.classList.remove("hidden");
+  p1CleanupCanvas.width = dw;
+  p1CleanupCanvas.height = dh;
+  p1CleanupCanvas.style.width = dw + "px";
+  p1CleanupCanvas.style.height = dh + "px";
+
+  if (cleanupFc) { cleanupFc.dispose(); cleanupFc = null; }
+  cleanupFc = new fabric.Canvas("p1-cleanup-canvas", {
+    width: dw, height: dh, selection: false,
+  });
+
+  // Set background to current clean image
+  fabric.Image.fromURL(phaseData.clean, function(img) {
+    img.scaleToWidth(dw);
+    cleanupFc.setBackgroundImage(img, cleanupFc.renderAll.bind(cleanupFc));
+  }, { crossOrigin: "anonymous" });
+
+  // Drawing logic
+  var _origin = null, _rect = null;
+
+  cleanupFc.on("mouse:down", function(opt) {
+    if (opt.target) return;
+    cleanupFc.discardActiveObject();
+    var ptr = cleanupFc.getPointer(opt.e);
+    _origin = { x: ptr.x, y: ptr.y };
+    _rect = new fabric.Rect({
+      left: ptr.x, top: ptr.y, width: 0, height: 0,
+      fill: "rgba(250,179,135,0.25)",
+      stroke: "#fab387",
+      strokeWidth: 2,
+      strokeDashArray: [6, 3],
+      selectable: false, evented: false,
+      _isCleanupBox: true,
+    });
+    cleanupFc.add(_rect);
+  });
+
+  cleanupFc.on("mouse:move", function(opt) {
+    if (!_origin || !_rect) return;
+    var ptr = cleanupFc.getPointer(opt.e);
+    _rect.set({
+      left:   Math.min(_origin.x, ptr.x),
+      top:    Math.min(_origin.y, ptr.y),
+      width:  Math.abs(ptr.x - _origin.x),
+      height: Math.abs(ptr.y - _origin.y),
+    });
+    cleanupFc.renderAll();
+  });
+
+  cleanupFc.on("mouse:up", function() {
+    if (!_rect) return;
+    if (_rect.width < 5 || _rect.height < 5) {
+      cleanupFc.remove(_rect);
+    } else {
+      _rect.set({
+        selectable: true, evented: true,
+        hasControls: true, hasBorders: true,
+        lockRotation: true,
+        cornerColor: "#cdd6f4", cornerSize: 8,
+        transparentCorners: false, cornerStyle: "circle",
+        borderColor: "#cdd6f4", hoverCursor: "move",
+      });
+      _rect.setControlsVisibility({ mtr: false });
+    }
+    _origin = null;
+    _rect = null;
+  });
+
+  // Delete key removes selected box
+  document.addEventListener("keydown", function _cleanupDel(e) {
+    if (!cleanupMode) { document.removeEventListener("keydown", _cleanupDel); return; }
+    if ((e.key === "Delete" || e.key === "Backspace") && cleanupFc) {
+      var active = cleanupFc.getActiveObject();
+      if (active && active._isCleanupBox) {
+        cleanupFc.remove(active);
+        cleanupFc.discardActiveObject();
+        cleanupFc.renderAll();
+      }
+    }
+  });
+}
+
 function openReviewPhase() {
   p1Original.src = phaseData.original;
   p1Clean.src = phaseData.clean;
   p1Info.textContent = `${phaseData.regions.length} text region(s) to render`;
+  exitCleanupMode();
   setPhase("review");
 }
 
-p1Back.addEventListener("click", () => setPhase("select"));
+p1CleanupToggle.addEventListener("click", function() {
+  if (cleanupMode) {
+    exitCleanupMode();
+  } else {
+    enterCleanupMode();
+  }
+});
+
+p1ClearBoxes.addEventListener("click", function() {
+  if (!cleanupFc) return;
+  var objs = cleanupFc.getObjects().filter(function(o) { return o._isCleanupBox; });
+  objs.forEach(function(o) { cleanupFc.remove(o); });
+  cleanupFc.discardActiveObject();
+  cleanupFc.renderAll();
+});
+
+p1ApplyCleanup.addEventListener("click", async function() {
+  if (!cleanupFc) return;
+  var boxes = cleanupFc.getObjects().filter(function(o) { return o._isCleanupBox; });
+  if (boxes.length === 0) return;
+
+  // Convert canvas coords to image coords
+  var rectangles = boxes.map(function(b) {
+    var sx = b.scaleX || 1, sy = b.scaleY || 1;
+    return {
+      x: Math.round(b.left / cleanupScale),
+      y: Math.round(b.top / cleanupScale),
+      width: Math.round((b.width * sx) / cleanupScale),
+      height: Math.round((b.height * sy) / cleanupScale),
+    };
+  });
+
+  p1CleanupLoading.classList.remove("hidden");
+  try {
+    var resp = await fetch("/manual-inpaint", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: phaseData.clean, rectangles: rectangles }),
+    });
+    if (!resp.ok) throw new Error("Cleanup failed");
+    var data = await resp.json();
+    phaseData.clean = data.clean;
+
+    // Refresh: exit cleanup mode and show updated clean image
+    exitCleanupMode();
+    p1Clean.src = phaseData.clean;
+  } catch (e) {
+    alert("Cleanup failed: " + e.message);
+  } finally {
+    p1CleanupLoading.classList.add("hidden");
+  }
+});
+
+p1Back.addEventListener("click", () => { exitCleanupMode(); setPhase("select"); });
 p1Next.addEventListener("click", () => {
+  exitCleanupMode();
   const editorData = {
     background: phaseData.clean,
     width: phaseData.width,
@@ -590,6 +770,7 @@ function buildCanvas(data) {
 
     canvasCont.style.width = dw + "px";
     canvasCont.style.height = dh + "px";
+    centerCanvas(dw, dh);
 
     const canvasEl = document.getElementById("editor-canvas");
     canvasEl.width = dw;
@@ -684,6 +865,14 @@ function buildCanvas(data) {
     fc.on("text:changed",       e => {
       if (e.target) { e.target._name = e.target.text.substring(0,28); refreshLayers(); pText.value = e.target.text; }
     });
+    // Track text selection changes inside textboxes
+    fc.on("text:selection:changed", e => {
+      if (e.target && e.target.isEditing) {
+        _lastEditObj = e.target;
+        _lastSelStart = e.target.selectionStart;
+        _lastSelEnd = e.target.selectionEnd;
+      }
+    });
 
     statusInfo.textContent = `${data.layers.length} text layers loaded`;
   });
@@ -693,6 +882,7 @@ function buildCanvas(data) {
 function onSel() {
   const o = fc.getActiveObject();
   if (!o || o.type !== "i-text" && o.type !== "textbox") { onDesel(); return; }
+  _lastEditObj = o;
   syncProps(o); noSel.classList.add("hidden"); propsDiv.classList.remove("hidden");
   highlightLayer(o);
 }
@@ -731,26 +921,99 @@ pText.addEventListener("input", () => {
 pSize.addEventListener("input", () => {
   const o = active(); if (!o) return;
   const s = parseInt(pSize.value, 10); pSizeVal.textContent = s;
-  o.set({ fontSize: s * baseScale, scaleX: 1, scaleY: 1 }); fc.renderAll();
+  if (o.isEditing && o.selectionStart !== o.selectionEnd) {
+    o.setSelectionStyles({ fontSize: s * baseScale }, o.selectionStart, o.selectionEnd);
+    o._forceClearCache = true; o.dirty = true; fc.requestRenderAll();
+  } else {
+    o.set({ fontSize: s * baseScale, scaleX: 1, scaleY: 1 }); fc.renderAll();
+  }
 });
 
-pColor.addEventListener("input", () => { const o = active(); if (!o) return; o.set("fill", pColor.value); fc.renderAll(); });
-pFont.addEventListener("change", () => { const o = active(); if (!o) return; o.set("fontFamily", pFont.value); fc.renderAll(); });
+pColor.addEventListener("input", () => {
+  const o = active(); if (!o) return;
+  if (o.isEditing && o.selectionStart !== o.selectionEnd) {
+    o.setSelectionStyles({ fill: pColor.value }, o.selectionStart, o.selectionEnd);
+    o._forceClearCache = true; o.dirty = true; fc.requestRenderAll();
+  } else {
+    o.set("fill", pColor.value); fc.renderAll();
+  }
+});
+pFont.addEventListener("change", () => {
+  const o = active(); if (!o) return;
+  if (o.isEditing && o.selectionStart !== o.selectionEnd) {
+    o.setSelectionStyles({ fontFamily: pFont.value }, o.selectionStart, o.selectionEnd);
+    o._forceClearCache = true; o.dirty = true; fc.requestRenderAll();
+  } else {
+    o.set("fontFamily", pFont.value); fc.renderAll();
+  }
+});
+
+// Prevent style controls from stealing focus (preserves text selection in textbox)
+// Note: skip range/select inputs as preventDefault breaks their interaction
+[pBold, pItalic, pUnderline].forEach(el => {
+  el.addEventListener("mousedown", e => e.preventDefault());
+});
+
+function _applyPartialStyle(prop, boldVal, normalVal) {
+  const o = active(); if (!o) return;
+  const start = o.selectionStart;
+  const end = o.selectionEnd;
+  console.log("[style]", prop, "sel:", start, end, "isEditing:", o.isEditing);
+  if (o.isEditing && start !== end) {
+    // Partial selection — per-character style
+    let allSet = true;
+    for (let i = start; i < end; i++) {
+      const s = o.getStyleAtPosition(i);
+      if (!s || s[prop] !== boldVal) { allSet = false; break; }
+    }
+    const newVal = allSet ? normalVal : boldVal;
+    const styleObj = {}; styleObj[prop] = newVal;
+    o.setSelectionStyles(styleObj, start, end);
+    o._forceClearCache = true;
+    o.dirty = true;
+    fc.requestRenderAll();
+    console.log("[style] applied", prop, "=", newVal, "to chars", start, "-", end);
+  } else {
+    // No selection — toggle whole textbox
+    const current = o[prop];
+    const newVal = current === boldVal ? normalVal : boldVal;
+    o.set(prop, newVal);
+    fc.requestRenderAll();
+  }
+}
 
 pBold.addEventListener("click", () => {
-  const o = active(); if (!o) return;
-  const v = o.fontWeight === "bold" ? "normal" : "bold";
-  o.set("fontWeight", v); pBold.classList.toggle("active", v === "bold"); fc.renderAll();
+  _applyPartialStyle("fontWeight", "bold", "normal");
+  const o = active();
+  if (o) pBold.classList.toggle("active", o.fontWeight === "bold");
 });
 pItalic.addEventListener("click", () => {
-  const o = active(); if (!o) return;
-  const v = o.fontStyle === "italic" ? "normal" : "italic";
-  o.set("fontStyle", v); pItalic.classList.toggle("active", v === "italic"); fc.renderAll();
+  _applyPartialStyle("fontStyle", "italic", "normal");
+  const o = active();
+  if (o) pItalic.classList.toggle("active", o.fontStyle === "italic");
 });
 pUnderline.addEventListener("click", () => {
   const o = active(); if (!o) return;
-  o.set("underline", !o.underline); pUnderline.classList.toggle("active", o.underline); fc.renderAll();
+  const start = o.selectionStart;
+  const end = o.selectionEnd;
+  if (o.isEditing && start !== end) {
+    let allUl = true;
+    for (let i = start; i < end; i++) {
+      const s = o.getStyleAtPosition(i);
+      if (!s || !s.underline) { allUl = false; break; }
+    }
+    const newVal = !allUl;
+    o.setSelectionStyles({ underline: newVal }, start, end);
+    o._forceClearCache = true;
+    o.dirty = true;
+    fc.requestRenderAll();
+  } else {
+    o.set("underline", !o.underline);
+    fc.requestRenderAll();
+  }
+  pUnderline.classList.toggle("active", !!o.underline);
 });
+
 pOpacity.addEventListener("input", () => {
   const o = active(); if (!o) return;
   o.set("opacity", parseInt(pOpacity.value, 10) / 100);
@@ -759,7 +1022,13 @@ pOpacity.addEventListener("input", () => {
 pX.addEventListener("change", () => { const o = active(); if (!o) return; o.set("left", parseInt(pX.value, 10) * baseScale); fc.renderAll(); });
 pY.addEventListener("change", () => { const o = active(); if (!o) return; o.set("top", parseInt(pY.value, 10) * baseScale); fc.renderAll(); });
 
-function active() { const o = fc ? fc.getActiveObject() : null; return (o && (o.type === "i-text" || o.type === "textbox")) ? o : null; }
+function active() {
+  let o = fc ? fc.getActiveObject() : null;
+  if (o && (o.type === "i-text" || o.type === "textbox")) return o;
+  // Fall back to last editing textbox (button clicks may deselect canvas object)
+  if (_lastEditObj && (_lastEditObj.type === "i-text" || _lastEditObj.type === "textbox")) return _lastEditObj;
+  return null;
+}
 
 // ── Layer list ───────────────────────────────────────────────────────────
 function refreshLayers() {
@@ -841,7 +1110,21 @@ function applyZoom(z) {
   const dh = Math.round(imgH * baseScale * zoomLevel);
   fc.setZoom(zoomLevel); fc.setWidth(dw); fc.setHeight(dh);
   canvasCont.style.width = dw + "px"; canvasCont.style.height = dh + "px";
+  centerCanvas(dw, dh);
   fc.renderAll(); updateZoomLabel();
+}
+
+function centerCanvas(dw, dh) {
+  // Use padding on scroll container to center canvas when smaller than viewport,
+  // no padding when larger so scrolling reaches all edges
+  const cw = dw + 80; // canvas + its 40px margin on each side
+  const ch = dh + 80;
+  const sw = scrollCont.clientWidth;
+  const sh = scrollCont.clientHeight;
+  const padX = Math.max(0, (sw - cw) / 2);
+  const padY = Math.max(0, (sh - ch) / 2);
+  scrollCont.style.paddingLeft = padX + "px";
+  scrollCont.style.paddingTop = padY + "px";
 }
 
 function updateZoomLabel() {
@@ -849,8 +1132,12 @@ function updateZoomLabel() {
 }
 
 workspace.addEventListener("wheel", e => {
-  if (!fc) return; e.preventDefault();
-  applyZoom(zoomLevel * (e.deltaY > 0 ? 0.9 : 1.1));
+  if (!fc) return;
+  // Ctrl+wheel = zoom, plain wheel = scroll the canvas
+  if (e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    applyZoom(zoomLevel * (e.deltaY > 0 ? 0.9 : 1.1));
+  }
 }, { passive: false });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -886,6 +1173,16 @@ p3Download.addEventListener("click", () => {
   const a = document.createElement("a");
   a.href = p3Result.src;
   a.download = "translated.png";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+});
+
+p3DownClean.addEventListener("click", () => {
+  if (!phaseData || !phaseData.clean) return;
+  const a = document.createElement("a");
+  a.href = phaseData.clean;
+  a.download = "cleaned.png";
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

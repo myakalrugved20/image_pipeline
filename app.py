@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import io
 import json
 import base64
@@ -44,9 +45,16 @@ app.state.max_request_size = 50 * 1024 * 1024  # 50MB
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
-# Load LaMa once (heavy model)
+# Load LaMa once (heavy model) — force CPU when CUDA is unavailable
 print("Loading LaMa inpainting model …")
-lama = SimpleLama()
+import torch
+if not torch.cuda.is_available():
+    _orig_jit_load = torch.jit.load
+    torch.jit.load = lambda f, **kw: _orig_jit_load(f, map_location="cpu", **kw)
+    lama = SimpleLama()
+    torch.jit.load = _orig_jit_load
+else:
+    lama = SimpleLama()
 print("LaMa ready.")
 
 # Google Vision client
@@ -78,7 +86,7 @@ def detect_text(image_bytes: bytes) -> list[dict]:
     """
     image = vision.Image(content=image_bytes)
     try:
-        response = vision_client.text_detection(image=image)
+        response = vision_client.document_text_detection(image=image)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Vision API error: {exc}")
 
@@ -109,18 +117,23 @@ def detect_text(image_bytes: bytes) -> list[dict]:
                 box_w = max(xs) - min(xs)
                 box_h = max(ys) - min(ys)
 
-                if box_h < 14 or box_w < 14:
-                    continue  # too small — likely icon text
-                if len(text.strip()) < 2:
-                    continue  # isolated single chars (icons, bullets)
-
-                # Icon detection: small, roughly-square region with short text
                 area = box_w * box_h
                 aspect = box_w / box_h if box_h > 0 else 999
                 word_count = len(text.split())
-                if area < 8000 and word_count <= 2 and 0.4 < aspect < 2.5:
-                    continue  # likely an icon with label text
 
+                if box_h < 4 or box_w < 4:
+                    print(f"[OCR SKIP] size filter: {box_w}x{box_h} — '{text[:50]}'")
+                    continue
+                if len(text.strip()) < 2:
+                    print(f"[OCR SKIP] short text: '{text}' — {box_w}x{box_h}")
+                    continue
+
+                # Icon detection: small, roughly-square region with short text
+                if area < 10000 and word_count <= 2 and 0.7 < aspect < 1.4:
+                    print(f"[OCR SKIP] icon filter: {box_w}x{box_h} area={area} aspect={aspect:.2f} words={word_count} — '{text[:50]}'")
+                    continue
+
+                print(f"[OCR KEEP] {box_w}x{box_h} area={area} — '{text[:60]}'")
                 regions.append({"text": text, "vertices": vertices})
 
     return regions
@@ -150,20 +163,87 @@ def _dilate_mask(arr: np.ndarray, dilation: int) -> np.ndarray:
     return cv2.dilate(arr, kernel, iterations=1)
 
 
-def create_mask(image_size: tuple[int, int], regions: list[dict]) -> Image.Image:
-    """Create a binary mask with per-region adaptive dilation."""
+def _text_pixel_mask(image_arr: np.ndarray, verts: list[tuple[int, int]],
+                     image_size: tuple[int, int]) -> np.ndarray:
+    """Create a mask of likely text pixels within a polygon region.
+
+    Uses edge detection + adaptive thresholding inside the bounding box
+    to find text strokes rather than filling the entire polygon.
+    Falls back to polygon fill for very small regions.
+    """
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    x0, y0 = max(0, min(xs)), max(0, min(ys))
+    x1, y1 = min(image_size[0], max(xs)), min(image_size[1], max(ys))
+    box_w, box_h = x1 - x0, y1 - y0
+
+    # For very small regions, fall back to polygon fill
+    if box_w < 20 or box_h < 12:
+        full = np.zeros((image_size[1], image_size[0]), dtype=np.uint8)
+        poly = Image.new("L", image_size, 0)
+        ImageDraw.Draw(poly).polygon(verts, fill=255)
+        return np.array(poly)
+
+    # Crop the image region
+    crop = image_arr[y0:y1, x0:x1]
+    if crop.size == 0:
+        full = np.zeros((image_size[1], image_size[0]), dtype=np.uint8)
+        poly = Image.new("L", image_size, 0)
+        ImageDraw.Draw(poly).polygon(verts, fill=255)
+        return np.array(poly)
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if len(crop.shape) == 3 else crop
+
+    # Adaptive threshold to find text pixels (works on varied backgrounds)
+    block_size = max(11, (min(box_w, box_h) // 4) | 1)  # ensure odd
+    text_thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, block_size, 8
+    )
+
+    # Also use Canny edges to catch text strokes
+    edges = cv2.Canny(gray, 50, 150)
+
+    # Combine: text pixels from threshold OR edges
+    combined = np.maximum(text_thresh, edges)
+
+    # Clip to the polygon region (don't mask outside the OCR polygon)
+    poly_mask_full = Image.new("L", image_size, 0)
+    ImageDraw.Draw(poly_mask_full).polygon(verts, fill=255)
+    poly_arr = np.array(poly_mask_full)
+    poly_crop = poly_arr[y0:y1, x0:x1]
+    combined = cv2.bitwise_and(combined, poly_crop)
+
+    # Place back into full-size mask
+    full = np.zeros((image_size[1], image_size[0]), dtype=np.uint8)
+    full[y0:y1, x0:x1] = combined
+    return full
+
+
+def create_mask(image_size: tuple[int, int], regions: list[dict],
+                image: Image.Image = None) -> Image.Image:
+    """Create a binary mask with per-region adaptive dilation.
+
+    If `image` is provided, uses text-pixel detection for precise masking.
+    Otherwise falls back to polygon fill.
+    """
     final_mask = np.zeros((image_size[1], image_size[0]), dtype=np.uint8)
+    image_arr = np.array(image.convert("RGB")) if image is not None else None
 
     for r in regions:
         verts = r["vertices"]
         ys = [v[1] for v in verts]
         box_h = max(ys) - min(ys)
-        dilation = max(2, min(box_h // 10, 12))
+        dilation = max(5, min(box_h // 5, 25))
 
-        # Draw this region's polygon on a temp mask
-        temp = Image.new("L", image_size, 0)
-        ImageDraw.Draw(temp).polygon(verts, fill=255)
-        temp_arr = np.array(temp)
+        if image_arr is not None:
+            # Text-pixel-based mask — only mask actual text strokes
+            temp_arr = _text_pixel_mask(image_arr, verts, image_size)
+        else:
+            # Fallback: solid polygon fill
+            temp = Image.new("L", image_size, 0)
+            ImageDraw.Draw(temp).polygon(verts, fill=255)
+            temp_arr = np.array(temp)
 
         # Dilate with region-specific radius
         temp_arr = _dilate_mask(temp_arr, dilation)
@@ -180,6 +260,35 @@ def inpaint(image: Image.Image, mask: Image.Image) -> Image.Image:
     """Remove text using LaMa."""
     result = lama(image.convert("RGB"), mask.convert("L"))
     return result
+
+
+def _region_area(region: dict) -> int:
+    """Compute bounding-box area from polygon vertices."""
+    verts = region["vertices"]
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+
+def inpaint_sequential(image: Image.Image, regions: list[dict],
+                       mask_mode: str = "precise") -> Image.Image:
+    """Inpaint regions one at a time, smallest first, for better quality.
+
+    mask_mode: "precise" uses text-pixel detection, "fill" uses polygon fill.
+    """
+    if not regions:
+        return image
+    use_image = image if mask_mode == "precise" else None
+    # Fallback to single pass when there are many regions (performance)
+    if len(regions) > 15:
+        mask = create_mask(image.size, regions, image=use_image)
+        return inpaint(image, mask)
+    sorted_regions = sorted(regions, key=_region_area)
+    current = image
+    for r in sorted_regions:
+        mask = create_mask(current.size, [r], image=current if mask_mode == "precise" else None)
+        current = inpaint(current, mask)
+    return current
 
 
 # ── Text colour sampling (K-means) ───────────────────────────────────────
@@ -824,6 +933,7 @@ async def phase1_clean(request: Request):
     original_image = body.get("original_image", "")
     selected_regions = body.get("selected_regions", [])
     target_lang = body.get("target_lang", "en")
+    mask_mode = body.get("mask_mode", "precise")  # "precise" or "fill"
 
     try:
         original = data_url_to_image(original_image)
@@ -853,9 +963,8 @@ async def phase1_clean(request: Request):
             verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
         mask_regions.append({"vertices": verts})
 
-    # Inpaint only selected areas
-    mask = create_mask(original.size, mask_regions)
-    inpainted = inpaint(original, mask)
+    # Inpaint regions — pass mask_mode to control masking strategy
+    inpainted = inpaint_sequential(original, mask_regions, mask_mode=mask_mode)
 
     # Build layer metadata
     layer_data = []
@@ -864,6 +973,26 @@ async def phase1_clean(request: Request):
         w, h = int(r["width"]), int(r["height"])
         trans_text = r.get("translatedText", "")
         orig_text = r.get("originalText", "")
+
+        # Custom drawn box with no text — run OCR on the crop
+        if not orig_text and not trans_text and w > 0 and h > 0:
+            crop = original.crop((
+                max(0, x), max(0, y),
+                min(original.width, x + w), min(original.height, y + h)
+            ))
+            buf = io.BytesIO()
+            crop.save(buf, format="PNG")
+            crop_regions = detect_text(buf.getvalue())
+            if crop_regions:
+                orig_text = " ".join(cr["text"] for cr in crop_regions)
+                translated = translate_texts([orig_text], "auto", target_lang)
+                trans_text = translated[0] if translated else orig_text
+            else:
+                # No text detected — still include as editable layer with placeholder
+                orig_text = "(undetected)"
+                trans_text = "(edit text)"
+                print(f"[OCR] Custom box {w}x{h} — no text detected, adding as editable layer")
+
         if not trans_text or w <= 0 or h <= 0:
             continue
 
@@ -943,6 +1072,44 @@ async def phase1_clean(request: Request):
     })
 
 
+# ── Manual Inpaint (touch-up residual artifacts) ─────────────────────────
+
+@app.post("/manual-inpaint")
+async def manual_inpaint(request: Request):
+    """Inpaint user-drawn rectangular regions on the clean image."""
+    body = await request.json()
+    image_data = body.get("image", "")
+    rectangles = body.get("rectangles", [])
+
+    if not image_data or not rectangles:
+        raise HTTPException(400, "image and rectangles required")
+
+    image = data_url_to_image(image_data)
+
+    # Convert rectangles to vertex-based regions for create_mask
+    mask_regions = []
+    for r in rectangles:
+        x, y, w, h = int(r["x"]), int(r["y"]), int(r["width"]), int(r["height"])
+        verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        mask_regions.append({"vertices": verts})
+
+    # Use polygon-fill mask (no text-pixel detection) with dilation for full coverage
+    mask_arr = np.zeros((image.height, image.width), dtype=np.uint8)
+    for mr in mask_regions:
+        temp = Image.new("L", image.size, 0)
+        ImageDraw.Draw(temp).polygon(mr["vertices"], fill=255)
+        temp_arr = np.array(temp)
+        # Dilate slightly for clean edges
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        temp_arr = cv2.dilate(temp_arr, kernel, iterations=1)
+        mask_arr = np.maximum(mask_arr, temp_arr)
+
+    mask = Image.fromarray(mask_arr)
+    result = inpaint(image, mask)
+
+    return JSONResponse({"clean": image_to_data_url(result)})
+
+
 # ── Phase 2: Server-side render ──────────────────────────────────────────
 
 @app.post("/phase2-render")
@@ -993,7 +1160,7 @@ async def translate_image(
 
     texts = [r["text"] for r in regions]
     translated = translate_texts(texts, source_lang, target_lang)
-    mask = create_mask(original.size, regions)
+    mask = create_mask(original.size, regions, image=original)
     inpainted = inpaint(original, mask)
     result = render_text(inpainted, original, inpainted, regions, translated, target_lang)
 
@@ -1030,7 +1197,7 @@ async def translate_layers(
 
     texts = [r["text"] for r in regions]
     translated = translate_texts(texts, source_lang, target_lang)
-    mask = create_mask(original.size, regions)
+    mask = create_mask(original.size, regions, image=original)
     inpainted = inpaint(original, mask)
 
     layers = []

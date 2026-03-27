@@ -83,6 +83,13 @@
         <span class="select-hint">Click = toggle selection &bull; Drag = move &bull; Corners = resize &bull; Delete key = remove</span>
       </div>
       <div class="select-toolbar-right">
+        <label class="tb-label" for="mask-mode" title="Precise: masks only detected text strokes (better for simple backgrounds). Fill: masks entire text region (better for complex/busy images).">Mask:
+          <select id="mask-mode" class="tb-select">
+            <option value="precise">Precise</option>
+            <option value="fill">Fill</option>
+          </select>
+        </label>
+        <span class="tb-sep"></span>
         <span id="sel-count" class="tb-label">0 selected</span>
         <button id="sel-clean" class="tb-btn tb-export">Clean Selected &rarr;</button>
       </div>
@@ -115,15 +122,25 @@
       </div>
       <div class="compare-panel">
         <h3>Clean (Text Removed)</h3>
-        <div class="compare-img-wrap">
+        <div class="compare-img-wrap" id="p1-clean-wrap">
           <img id="p1-clean" alt="Clean" />
+          <canvas id="p1-cleanup-canvas" class="hidden"></canvas>
         </div>
       </div>
     </div>
     <div class="phase-actions">
       <button id="p1-back" class="action-btn action-secondary">&larr; Back to Selection</button>
+      <button id="p1-cleanup-toggle" class="action-btn action-secondary">&#9998; Manual Cleanup</button>
+      <button id="p1-apply-cleanup" class="action-btn action-primary hidden">Apply Cleanup</button>
+      <button id="p1-clear-boxes" class="action-btn action-secondary hidden">Clear Boxes</button>
       <span class="phase-info" id="p1-info"></span>
       <button id="p1-next" class="action-btn action-primary">Next: Edit Text &rarr;</button>
+    </div>
+    <div id="p1-cleanup-loading" class="hidden" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);z-index:10">
+      <div style="text-align:center">
+        <div class="spinner"></div>
+        <p style="color:#cdd6f4">Applying cleanup&hellip;</p>
+      </div>
     </div>
   </div>
 
@@ -261,6 +278,7 @@
       </div>
       <div class="phase-actions">
         <button id="p3-back" class="action-btn action-secondary">&larr; Back to Editor</button>
+        <button id="p3-download-clean" class="action-btn action-secondary">&#11015; Download Clean Image</button>
         <button id="p3-download" class="action-btn action-download">&#11015; Download PNG</button>
       </div>
     </div>
