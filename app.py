@@ -50,7 +50,7 @@ print("Loading LaMa inpainting model …")
 import torch
 if not torch.cuda.is_available():
     _orig_jit_load = torch.jit.load
-    torch.jit.load = lambda f, **kw: _orig_jit_load(f, map_location="cpu", **kw)
+    torch.jit.load = lambda f, **kw: _orig_jit_load(f, **{**kw, "map_location": "cpu"})
     lama = SimpleLama()
     torch.jit.load = _orig_jit_load
 else:
