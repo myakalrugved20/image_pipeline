@@ -45,17 +45,23 @@ app.state.max_request_size = 50 * 1024 * 1024  # 50MB
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
-# Load LaMa once (heavy model) — force CPU when CUDA is unavailable
-print("Loading LaMa inpainting model …")
+# Lazy-load LaMa (heavy model) — deferred so the server starts fast on HF Spaces
 import torch
-if not torch.cuda.is_available():
-    _orig_jit_load = torch.jit.load
-    torch.jit.load = lambda f, **kw: _orig_jit_load(f, **{**kw, "map_location": "cpu"})
-    lama = SimpleLama()
-    torch.jit.load = _orig_jit_load
-else:
-    lama = SimpleLama()
-print("LaMa ready.")
+_lama = None
+
+def get_lama():
+    global _lama
+    if _lama is None:
+        print("Loading LaMa inpainting model …")
+        if not torch.cuda.is_available():
+            _orig_jit_load = torch.jit.load
+            torch.jit.load = lambda f, **kw: _orig_jit_load(f, **{**kw, "map_location": "cpu"})
+            _lama = SimpleLama()
+            torch.jit.load = _orig_jit_load
+        else:
+            _lama = SimpleLama()
+        print("LaMa ready.")
+    return _lama
 
 # Google Vision client
 vision_client = vision.ImageAnnotatorClient()
@@ -258,7 +264,7 @@ def create_mask(image_size: tuple[int, int], regions: list[dict],
 
 def inpaint(image: Image.Image, mask: Image.Image) -> Image.Image:
     """Remove text using LaMa."""
-    result = lama(image.convert("RGB"), mask.convert("L"))
+    result = get_lama()(image.convert("RGB"), mask.convert("L"))
     return result
 
 
