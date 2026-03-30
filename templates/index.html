@@ -94,10 +94,21 @@
         <button id="sel-clean" class="tb-btn tb-export">Clean Selected &rarr;</button>
       </div>
     </div>
-    <div class="select-workspace" id="select-workspace">
-      <div class="ed-canvas-scroll">
-        <div class="select-canvas-container" id="select-canvas-container">
-          <canvas id="select-canvas"></canvas>
+    <div class="select-body">
+      <div class="select-workspace" id="select-workspace">
+        <div class="ed-canvas-scroll">
+          <div class="select-canvas-container" id="select-canvas-container">
+            <canvas id="select-canvas"></canvas>
+          </div>
+        </div>
+      </div>
+      <div class="magnifier-panel" id="magnifier-panel">
+        <div class="panel-section">
+          <h4>Magnifier (3&times;)</h4>
+          <canvas id="magnifier-canvas"></canvas>
+          <div class="magnifier-info">
+            <span id="magnifier-coords">X: &mdash; Y: &mdash;</span>
+          </div>
         </div>
       </div>
     </div>

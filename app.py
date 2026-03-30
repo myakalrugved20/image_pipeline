@@ -1,5 +1,9 @@
 import os
+import sys
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+if sys.stdout.encoding and sys.stdout.encoding.lower().startswith("cp"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import io
 import json
 import base64
@@ -868,7 +872,7 @@ def data_url_to_image(data_url: str) -> Image.Image:
 
 @app.get("/")
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="index.html")
 
 
 @app.get("/languages")

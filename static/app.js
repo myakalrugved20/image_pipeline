@@ -48,6 +48,13 @@ const selWorkspace = document.getElementById("select-workspace");
 const selCanvasCont = document.getElementById("select-canvas-container");
 const selLoading   = document.getElementById("sel-loading");
 
+// DOM — Magnifier (Phase 1)
+const magnifierCanvas = document.getElementById("magnifier-canvas");
+const magnifierCoords = document.getElementById("magnifier-coords");
+let magnifierCtx = null;
+let magnifierImg = null;
+const MAGNIFIER_ZOOM = 3;
+
 // DOM — Review (Phase 2)
 const phase1View   = document.getElementById("phase1-view");
 const p1Original   = document.getElementById("p1-original");
@@ -262,6 +269,48 @@ function deleteActiveBox() {
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Magnifier
+// ══════════════════════════════════════════════════════════════════════════
+function drawMagnifier(origX, origY) {
+  if (!magnifierCtx || !magnifierImg || !magnifierImg.complete) return;
+  var cw = magnifierCanvas.width;
+  var ch = magnifierCanvas.height;
+  var viewW = cw / MAGNIFIER_ZOOM;
+  var viewH = ch / MAGNIFIER_ZOOM;
+  var sx = origX - viewW / 2;
+  var sy = origY - viewH / 2;
+
+  magnifierCtx.clearRect(0, 0, cw, ch);
+  magnifierCtx.fillStyle = "#15152a";
+  magnifierCtx.fillRect(0, 0, cw, ch);
+  magnifierCtx.drawImage(magnifierImg, sx, sy, viewW, viewH, 0, 0, cw, ch);
+
+  // Crosshair
+  var cx = cw / 2, cy = ch / 2;
+  magnifierCtx.save();
+  magnifierCtx.strokeStyle = "rgba(0, 0, 0, 0.8)";
+  magnifierCtx.lineWidth = 1;
+  magnifierCtx.setLineDash([4, 4]);
+  magnifierCtx.beginPath(); magnifierCtx.moveTo(0, cy); magnifierCtx.lineTo(cw, cy); magnifierCtx.stroke();
+  magnifierCtx.beginPath(); magnifierCtx.moveTo(cx, 0); magnifierCtx.lineTo(cx, ch); magnifierCtx.stroke();
+  magnifierCtx.setLineDash([]);
+  magnifierCtx.beginPath(); magnifierCtx.arc(cx, cy, 3, 0, Math.PI * 2); magnifierCtx.stroke();
+  magnifierCtx.restore();
+
+  magnifierCoords.textContent = "X: " + Math.round(origX) + "  Y: " + Math.round(origY);
+}
+
+function clearMagnifier() {
+  if (!magnifierCtx) return;
+  var cw = magnifierCanvas.width;
+  var ch = magnifierCanvas.height;
+  magnifierCtx.clearRect(0, 0, cw, ch);
+  magnifierCtx.fillStyle = "#15152a";
+  magnifierCtx.fillRect(0, 0, cw, ch);
+  magnifierCoords.textContent = "X: \u2014 Y: \u2014";
+}
+
 function openSelectionPhase() {
   setPhase("select");
   if (selFc) { selFc.dispose(); selFc = null; }
@@ -296,6 +345,19 @@ function openSelectionPhase() {
       img.scaleToWidth(dw);
       selFc.setBackgroundImage(img, selFc.renderAll.bind(selFc));
     }, { crossOrigin: "anonymous" });
+
+    /* Magnifier setup --------------------------------------------------- */
+    magnifierImg = new Image();
+    magnifierImg.crossOrigin = "anonymous";
+    magnifierImg.src = detectData.original;
+    magnifierCtx = magnifierCanvas.getContext("2d");
+    // Size canvas to its CSS-rendered dimensions after layout settles
+    setTimeout(function() {
+      var rect = magnifierCanvas.getBoundingClientRect();
+      magnifierCanvas.width = Math.round(rect.width);
+      magnifierCanvas.height = Math.round(rect.height);
+      clearMagnifier();
+    }, 50);
 
     /* OCR boxes --------------------------------------------------------- */
     detectData.regions.forEach(function(r, i) {
@@ -414,6 +476,14 @@ function openSelectionPhase() {
       updateSelCount();
     });
 
+    /* Magnifier tracking ------------------------------------------------- */
+    selFc.on("mouse:move", function(opt) {
+      if (!magnifierCtx || !magnifierImg) return;
+      var ptr = selFc.getPointer(opt.e);
+      drawMagnifier(ptr.x / selBaseScale, ptr.y / selBaseScale);
+    });
+    selFc.on("mouse:out", clearMagnifier);
+
     /* keyboard delete */
     document.addEventListener("keydown", _selKeyHandler);
   });
@@ -443,6 +513,8 @@ function updateSelCount() {
 selBack.addEventListener("click", function() {
   document.removeEventListener("keydown", _selKeyHandler);
   if (selFc) { selFc.dispose(); selFc = null; }
+  magnifierImg = null;
+  magnifierCtx = null;
   setPhase("upload");
 });
 
