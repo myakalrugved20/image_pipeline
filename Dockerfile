@@ -23,4 +23,4 @@ RUN python download_fonts.py
 ENV PORT=7860
 EXPOSE 7860
 
-CMD ["python", "app.py"]
+CMD bash -c 'if [ -n "$GOOGLE_APPLICATION_CREDENTIALS_JSON" ]; then echo "$GOOGLE_APPLICATION_CREDENTIALS_JSON" > /tmp/gcloud-key.json; export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcloud-key.json; fi && python app.py'
