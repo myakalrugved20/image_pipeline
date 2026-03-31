@@ -111,6 +111,9 @@ const canvasCont   = document.getElementById("ed-canvas-container");
 const btnTogglePreview = document.getElementById("btn-toggle-preview");
 const edPreviewPanel   = document.getElementById("ed-preview-panel");
 const edPreviewImg     = document.getElementById("ed-preview-img");
+const btnDownloadClean = document.getElementById("btn-download-clean");
+const btnUploadBg      = document.getElementById("btn-upload-bg");
+const bgFileInput      = document.getElementById("bg-file-input");
 
 // DOM — Export (Phase 4)
 const phase3View   = document.getElementById("phase3-view");
@@ -1149,6 +1152,50 @@ btnBack.addEventListener("click", () => setPhase("review"));
 btnTogglePreview.addEventListener("click", () => {
   edPreviewPanel.classList.toggle("hidden");
   btnTogglePreview.classList.toggle("tb-active");
+});
+
+btnDownloadClean.addEventListener("click", () => {
+  if (!phaseData || !phaseData.clean) return;
+  const dataUrl = phaseData.clean;
+  const byteString = atob(dataUrl.split(",")[1]);
+  const mimeType = dataUrl.split(",")[0].split(":")[1].split(";")[0];
+  const ab = new ArrayBuffer(byteString.length);
+  const ia = new Uint8Array(ab);
+  for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
+  const blob = new Blob([ab], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "cleaned.png";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+});
+
+btnUploadBg.addEventListener("click", () => bgFileInput.click());
+bgFileInput.addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const dataUrl = ev.target.result;
+    const img = new Image();
+    img.onload = () => {
+      if (img.width !== imgW || img.height !== imgH) {
+        if (!confirm(`Uploaded image is ${img.width}x${img.height} but original is ${imgW}x${imgH}. Dimensions differ — this may cause misalignment. Proceed anyway?`)) return;
+      }
+      phaseData.clean = dataUrl;
+      const dw = Math.round(imgW * baseScale);
+      fabric.Image.fromURL(dataUrl, function(fImg) {
+        fImg.scaleToWidth(dw);
+        fc.setBackgroundImage(fImg, fc.renderAll.bind(fc));
+      }, { crossOrigin: "anonymous" });
+    };
+    img.src = dataUrl;
+  };
+  reader.readAsDataURL(file);
+  bgFileInput.value = "";
 });
 
 toolMove.addEventListener("click", () => setTool("move"));
