@@ -194,7 +194,7 @@
             <label class="prop-label">Font Size
               <div class="slider-row">
                 <input type="range" id="p-size" min="4" max="300" value="24" />
-                <span id="p-size-val">24</span><span class="unit">px</span>
+                <input type="number" id="p-size-val" min="4" max="300" value="24" class="size-input" /><span class="unit">px</span>
               </div>
             </label>
             <label class="prop-label">Color
@@ -214,6 +214,15 @@
               <button id="p-bold" class="style-btn" title="Bold"><b>B</b></button>
               <button id="p-italic" class="style-btn" title="Italic"><i>I</i></button>
               <button id="p-underline" class="style-btn" title="Underline"><u>U</u></button>
+              <button id="p-superscript" class="style-btn" title="Superscript">A&#x00B2;</button>
+              <button id="p-subscript" class="style-btn" title="Subscript">A&#x2082;</button>
+            </div>
+            <div class="prop-label">Alignment</div>
+            <div class="align-row">
+              <button id="p-align-left" class="style-btn align-btn" title="Align Left" data-align="left"><svg viewBox="0 0 18 18"><line x1="2" y1="4" x2="16" y2="4"/><line x1="2" y1="8" x2="11" y2="8"/><line x1="2" y1="12" x2="14" y2="12"/><line x1="2" y1="16" x2="10" y2="16"/></svg></button>
+              <button id="p-align-center" class="style-btn align-btn" title="Align Center" data-align="center"><svg viewBox="0 0 18 18"><line x1="2" y1="4" x2="16" y2="4"/><line x1="4" y1="8" x2="14" y2="8"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="5" y1="16" x2="13" y2="16"/></svg></button>
+              <button id="p-align-right" class="style-btn align-btn" title="Align Right" data-align="right"><svg viewBox="0 0 18 18"><line x1="2" y1="4" x2="16" y2="4"/><line x1="7" y1="8" x2="16" y2="8"/><line x1="4" y1="12" x2="16" y2="12"/><line x1="8" y1="16" x2="16" y2="16"/></svg></button>
+              <button id="p-align-justify" class="style-btn align-btn" title="Justify" data-align="justify"><svg viewBox="0 0 18 18"><line x1="2" y1="4" x2="16" y2="4"/><line x1="2" y1="8" x2="16" y2="8"/><line x1="2" y1="12" x2="16" y2="12"/><line x1="2" y1="16" x2="16" y2="16"/></svg></button>
             </div>
             <label class="prop-label">Opacity
               <div class="slider-row">
@@ -228,22 +237,27 @@
               </div>
             </label>
           </div>
-        </div>
-      </div>
-
-      <div class="ed-preview-panel hidden" id="ed-preview-panel">
-        <div class="panel-section">
-          <h4>Original Image</h4>
-          <div class="ed-preview-wrap">
-            <img id="ed-preview-img" alt="Original" />
+          <div id="multi-sel" class="hidden">
+            <div class="prop-label">Multi-Select</div>
+            <button id="btn-match-size" class="action-btn action-secondary" style="width:100%;margin-top:.3rem;" title="Set all selected layers to the smallest font size among them">Match Font Size</button>
+            <button id="btn-match-style" class="action-btn action-secondary" style="width:100%;margin-top:.3rem;" title="Copy bold/italic/underline from first selected to all">Match Style</button>
           </div>
         </div>
       </div>
 
-      <div class="ed-workspace" id="ed-workspace">
-        <div class="ed-canvas-scroll" id="ed-canvas-scroll">
-          <div class="ed-canvas-container" id="ed-canvas-container">
-            <canvas id="editor-canvas"></canvas>
+      <div class="ed-split" id="ed-split">
+        <div class="ed-split-pane" id="ed-preview-panel">
+          <div class="ed-pane-header">Original Image</div>
+          <div class="ed-preview-wrap">
+            <img id="ed-preview-img" alt="Original" />
+          </div>
+        </div>
+        <div class="ed-split-pane" id="ed-workspace">
+          <div class="ed-pane-header">Edited Image</div>
+          <div class="ed-canvas-scroll" id="ed-canvas-scroll">
+            <div class="ed-canvas-container" id="ed-canvas-container">
+              <canvas id="editor-canvas"></canvas>
+            </div>
           </div>
         </div>
       </div>

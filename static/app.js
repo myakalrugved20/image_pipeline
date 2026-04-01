@@ -1,4 +1,70 @@
 // ══════════════════════════════════════════════════════════════════════════
+// CJK Helper: Insert zero-width spaces between CJK characters for wrapping
+// ══════════════════════════════════════════════════════════════════════════
+function _isCJKChar(cp) {
+  return (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+         (cp >= 0x3000 && cp <= 0x303F) || (cp >= 0x3040 && cp <= 0x309F) ||
+         (cp >= 0x30A0 && cp <= 0x30FF) || (cp >= 0xAC00 && cp <= 0xD7AF) ||
+         (cp >= 0xFF00 && cp <= 0xFFEF) || (cp >= 0x20000 && cp <= 0x2A6DF);
+}
+
+function _addCJKBreaks(text) {
+  let hasCJK = false;
+  for (let i = 0; i < text.length; i++) {
+    if (_isCJKChar(text.codePointAt(i))) { hasCJK = true; break; }
+  }
+  if (!hasCJK) return text;
+  // Insert thin spaces between CJK characters so Fabric.js can wrap
+  let result = "";
+  for (let i = 0; i < text.length; i++) {
+    result += text[i];
+    const cp = text.codePointAt(i);
+    if (i < text.length - 1) {
+      const nextCp = text.codePointAt(i + 1);
+      // Add thin space between two CJK chars, or CJK + punctuation
+      if (_isCJKChar(cp) && _isCJKChar(nextCp)) {
+        result += " ";
+      } else if (_isCJKChar(cp) && !_isCJKChar(nextCp) && text[i + 1] !== " ") {
+        result += " ";
+      } else if (!_isCJKChar(cp) && _isCJKChar(nextCp) && text[i] !== " ") {
+        result += " ";
+      }
+    }
+  }
+  return result;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Fabric.js Patch: Don't justify the last line of each paragraph
+// ══════════════════════════════════════════════════════════════════════════
+(function() {
+  const orig = fabric.Textbox.prototype._getLineStyle;
+  // Override _renderTextLine to temporarily switch alignment for last lines
+  const origRender = fabric.Textbox.prototype._renderTextLine;
+  fabric.Textbox.prototype._renderTextLine = function(method, ctx, line, left, top, lineIndex) {
+    if (this.textAlign === "justify" && this._isLastLineOfParagraph(lineIndex)) {
+      this.textAlign = "left";
+      origRender.call(this, method, ctx, line, left, top, lineIndex);
+      this.textAlign = "justify";
+    } else {
+      origRender.call(this, method, ctx, line, left, top, lineIndex);
+    }
+  };
+
+  fabric.Textbox.prototype._isLastLineOfParagraph = function(lineIndex) {
+    // Last line of the entire text
+    if (lineIndex === this._textLines.length - 1) return true;
+    // Use _styleMap to check if the next line belongs to a different hard paragraph
+    if (this._styleMap) {
+      const cur = this._styleMap[lineIndex];
+      const next = this._styleMap[lineIndex + 1];
+      if (cur && next && cur.line !== next.line) return true;
+    }
+    return false;
+  };
+})();
+
+// ══════════════════════════════════════════════════════════════════════════
 // State
 // ══════════════════════════════════════════════════════════════════════════
 let selectedFile  = null;
@@ -81,6 +147,9 @@ const zoomLabel    = document.getElementById("zoom-level");
 const btnExport    = document.getElementById("btn-export");
 const noSel        = document.getElementById("no-sel");
 const propsDiv     = document.getElementById("props");
+const multiSelDiv  = document.getElementById("multi-sel");
+const btnMatchSize = document.getElementById("btn-match-size");
+const btnMatchStyle = document.getElementById("btn-match-style");
 const pText        = document.getElementById("p-text");
 const pSize        = document.getElementById("p-size");
 const pSizeVal     = document.getElementById("p-size-val");
@@ -112,6 +181,8 @@ const btnTogglePreview = document.getElementById("btn-toggle-preview");
 const edPreviewPanel   = document.getElementById("ed-preview-panel");
 const edPreviewImg     = document.getElementById("ed-preview-img");
 const btnDownloadClean = document.getElementById("btn-download-clean");
+const pSuperscript = document.getElementById("p-superscript");
+const pSubscript   = document.getElementById("p-subscript");
 const btnUploadBg      = document.getElementById("btn-upload-bg");
 const bgFileInput      = document.getElementById("bg-file-input");
 
@@ -904,14 +975,14 @@ function buildCanvas(data) {
         opts.top  = (l.y + l.height / 2) * baseScale;
       }
 
-      const t = new fabric.Textbox(l.translatedText, opts);
+      const t = new fabric.Textbox(_addCJKBreaks(l.translatedText), opts);
 
-      // Trust server's font size but shrink if browser renders larger
+      // Trust server's font size but shrink if browser renders larger than bounding box
       t._clearCache();
       t.initDimensions();
       let fontSize = t.fontSize;
-      while (t.calcTextHeight() > fitH && fontSize > 4) {
-        fontSize--;
+      while ((t.calcTextHeight() > fitH || t.calcTextWidth() > fitW) && fontSize > 4) {
+        fontSize = Math.max(4, fontSize - (fontSize > 20 ? 2 : 1));
         t.set("fontSize", fontSize);
         t._clearCache();
         t.initDimensions();
@@ -931,12 +1002,118 @@ function buildCanvas(data) {
     updateZoomLabel();
     refreshLayers();
 
+    // ── Snapping alignment guidelines ──
+    const SNAP_THRESHOLD = 5;
+    let _guideLines = []; // Fabric.js Line objects on canvas
+
+    function _clearGuides() {
+      _guideLines.forEach(l => fc.remove(l));
+      _guideLines = [];
+    }
+
+    function _addGuideLine(coords, color) {
+      const line = new fabric.Line(coords, {
+        stroke: color || "#ff00ff",
+        strokeWidth: 1,
+        strokeDashArray: [6, 4],
+        selectable: false,
+        evented: false,
+        excludeFromExport: true,
+        _isGuideline: true,
+      });
+      fc.add(line);
+      _guideLines.push(line);
+    }
+
+    function _calcGuidelines(target) {
+      _clearGuides();
+      const tb = target.getBoundingRect(true, true);
+      const tCx = tb.left + tb.width / 2;
+      const tCy = tb.top + tb.height / 2;
+      const tPoints = {
+        left: tb.left, right: tb.left + tb.width, cx: tCx,
+        top: tb.top, bottom: tb.top + tb.height, cy: tCy,
+      };
+
+      const snaps = { x: null, y: null };
+      const canvasW = fc.width, canvasH = fc.height;
+
+      // Crosshair through the moving object's center
+      _addGuideLine([tCx, 0, tCx, canvasH], "rgba(255,0,255,0.35)");
+      _addGuideLine([0, tCy, canvasW, tCy], "rgba(255,0,255,0.35)");
+
+      // Canvas center guidelines
+      if (Math.abs(tPoints.cx - canvasW / 2) < SNAP_THRESHOLD) {
+        snaps.x = canvasW / 2 - tb.width / 2;
+        _addGuideLine([canvasW / 2, 0, canvasW / 2, canvasH]);
+      }
+      if (Math.abs(tPoints.cy - canvasH / 2) < SNAP_THRESHOLD) {
+        snaps.y = canvasH / 2 - tb.height / 2;
+        _addGuideLine([0, canvasH / 2, canvasW, canvasH / 2]);
+      }
+
+      // Object-to-object guidelines
+      fc.getObjects().forEach(obj => {
+        if (obj === target || obj._isGuideline) return;
+        const ob = obj.getBoundingRect(true, true);
+        const oCx = ob.left + ob.width / 2;
+        const oCy = ob.top + ob.height / 2;
+        const oPoints = {
+          left: ob.left, right: ob.left + ob.width, cx: oCx,
+          top: ob.top, bottom: ob.top + ob.height, cy: oCy,
+        };
+
+        // Vertical snaps (x-axis alignment)
+        if (snaps.x === null) {
+          const vPairs = [
+            [tPoints.left, oPoints.left], [tPoints.left, oPoints.right], [tPoints.left, oPoints.cx],
+            [tPoints.right, oPoints.left], [tPoints.right, oPoints.right], [tPoints.right, oPoints.cx],
+            [tPoints.cx, oPoints.left], [tPoints.cx, oPoints.right], [tPoints.cx, oPoints.cx],
+          ];
+          for (const [tv, ov] of vPairs) {
+            if (Math.abs(tv - ov) < SNAP_THRESHOLD) {
+              const offset = tv - tPoints.left;
+              snaps.x = ov - offset;
+              const y1 = Math.min(tb.top, ob.top) - 20;
+              const y2 = Math.max(tb.top + tb.height, ob.top + ob.height) + 20;
+              _addGuideLine([ov, y1, ov, y2]);
+              break;
+            }
+          }
+        }
+
+        // Horizontal snaps (y-axis alignment)
+        if (snaps.y === null) {
+          const hPairs = [
+            [tPoints.top, oPoints.top], [tPoints.top, oPoints.bottom], [tPoints.top, oPoints.cy],
+            [tPoints.bottom, oPoints.top], [tPoints.bottom, oPoints.bottom], [tPoints.bottom, oPoints.cy],
+            [tPoints.cy, oPoints.top], [tPoints.cy, oPoints.bottom], [tPoints.cy, oPoints.cy],
+          ];
+          for (const [tv, ov] of hPairs) {
+            if (Math.abs(tv - ov) < SNAP_THRESHOLD) {
+              const offset = tv - tPoints.top;
+              snaps.y = ov - offset;
+              const x1 = Math.min(tb.left, ob.left) - 20;
+              const x2 = Math.max(tb.left + tb.width, ob.left + ob.width) + 20;
+              _addGuideLine([x1, ov, x2, ov]);
+              break;
+            }
+          }
+        }
+      });
+
+      // Apply snap
+      if (snaps.x !== null) target.set("left", target.left + (snaps.x - tb.left));
+      if (snaps.y !== null) target.set("top",  target.top  + (snaps.y - tb.top));
+    }
+
     fc.off();
     fc.on("selection:created",  onSel);
     fc.on("selection:updated",  onSel);
     fc.on("selection:cleared",  onDesel);
-    fc.on("object:modified",    () => { const o = fc.getActiveObject(); if (o) syncProps(o); });
-    fc.on("object:moving",      () => { const o = fc.getActiveObject(); if (o) syncPos(o); });
+    fc.on("object:modified",    () => { _clearGuides(); fc.requestRenderAll(); const o = fc.getActiveObject(); if (o) syncProps(o); });
+    fc.on("object:moving",      () => { const o = fc.getActiveObject(); if (o) { _calcGuidelines(o); syncPos(o); } });
+    fc.on("mouse:up",           () => { _clearGuides(); fc.requestRenderAll(); });
     fc.on("text:changed",       e => {
       if (e.target) { e.target._name = e.target.text.substring(0,28); refreshLayers(); pText.value = e.target.text; }
     });
@@ -954,23 +1131,60 @@ function buildCanvas(data) {
 }
 
 // ── Selection ────────────────────────────────────────────────────────────
+let _multiSelectMode = false;
+
+function _getSelectedTextObjects() {
+  const o = fc.getActiveObject();
+  if (!o) return [];
+  if (o.type === "activeSelection") {
+    return o.getObjects().filter(x => x.type === "textbox" || x.type === "i-text");
+  }
+  if (o.type === "textbox" || o.type === "i-text") return [o];
+  return [];
+}
+
 function onSel() {
   const o = fc.getActiveObject();
-  if (!o || o.type !== "i-text" && o.type !== "textbox") { onDesel(); return; }
+  if (!o) { onDesel(); return; }
+  // Multi-select (ActiveSelection)
+  if (o.type === "activeSelection") {
+    const textObjs = o.getObjects().filter(x => x.type === "textbox" || x.type === "i-text");
+    if (textObjs.length === 0) { onDesel(); return; }
+    _multiSelectMode = true;
+    noSel.classList.add("hidden");
+    propsDiv.classList.remove("hidden");
+    multiSelDiv.classList.remove("hidden");
+    // Hide single-object-only fields (text content, position)
+    pText.parentElement.classList.add("hidden");
+    document.querySelector(".pos-row").parentElement.classList.add("hidden");
+    // Sync props from first object in selection
+    syncProps(textObjs[0]);
+    highlightLayer(null);
+    return;
+  }
+  if (o.type !== "i-text" && o.type !== "textbox") { onDesel(); return; }
+  _multiSelectMode = false;
   _lastEditObj = o;
+  multiSelDiv.classList.add("hidden");
+  pText.parentElement.classList.remove("hidden");
+  document.querySelector(".pos-row").parentElement.classList.remove("hidden");
   syncProps(o); noSel.classList.add("hidden"); propsDiv.classList.remove("hidden");
   highlightLayer(o);
 }
 
 function onDesel() {
+  _multiSelectMode = false;
   noSel.classList.remove("hidden"); propsDiv.classList.add("hidden");
+  multiSelDiv.classList.add("hidden");
+  pText.parentElement.classList.remove("hidden");
+  document.querySelector(".pos-row").parentElement.classList.remove("hidden");
   highlightLayer(null);
 }
 
 function syncProps(o) {
   pText.value = o.text;
   const realSize = Math.round(o.fontSize * o.scaleY / baseScale);
-  pSize.value = realSize; pSizeVal.textContent = realSize;
+  pSize.value = realSize; pSizeVal.value = realSize;
   pColor.value = rgbToHex(o.fill);
   pFont.value = o.fontFamily;
   pBold.classList.toggle("active", o.fontWeight === "bold");
@@ -978,6 +1192,7 @@ function syncProps(o) {
   pUnderline.classList.toggle("active", !!o.underline);
   pOpacity.value = Math.round(o.opacity * 100);
   pOpacityVal.textContent = Math.round(o.opacity * 100);
+  document.querySelectorAll(".align-btn").forEach(b => b.classList.toggle("active", b.dataset.align === o.textAlign));
   syncPos(o);
 }
 
@@ -993,34 +1208,64 @@ pText.addEventListener("input", () => {
   fc.renderAll(); refreshLayers();
 });
 
-pSize.addEventListener("input", () => {
-  const o = active(); if (!o) return;
-  const s = parseInt(pSize.value, 10); pSizeVal.textContent = s;
-  if (o.isEditing && o.selectionStart !== o.selectionEnd) {
-    o.setSelectionStyles({ fontSize: s * baseScale }, o.selectionStart, o.selectionEnd);
-    o._forceClearCache = true; o.dirty = true; fc.requestRenderAll();
+function _applyToAll(fn) {
+  if (_multiSelectMode) {
+    _getSelectedTextObjects().forEach(fn);
+    fc.requestRenderAll();
   } else {
-    o.set({ fontSize: s * baseScale, scaleX: 1, scaleY: 1 }); fc.renderAll();
+    const o = active(); if (!o) return;
+    fn(o);
+    fc.requestRenderAll();
   }
+}
+
+pSize.addEventListener("input", () => {
+  const s = parseInt(pSize.value, 10); pSizeVal.value = s;
+  _applyToAll(o => {
+    if (!_multiSelectMode && o.isEditing && o.selectionStart !== o.selectionEnd) {
+      o.setSelectionStyles({ fontSize: s * baseScale }, o.selectionStart, o.selectionEnd);
+      o._forceClearCache = true; o.dirty = true;
+    } else {
+      o.set({ fontSize: s * baseScale, scaleX: 1, scaleY: 1 });
+    }
+  });
+});
+
+pSizeVal.addEventListener("input", () => {
+  let s = parseInt(pSizeVal.value, 10);
+  if (isNaN(s) || s < 4) s = 4;
+  if (s > 300) s = 300;
+  pSize.value = s;
+  _applyToAll(o => {
+    if (!_multiSelectMode && o.isEditing && o.selectionStart !== o.selectionEnd) {
+      o.setSelectionStyles({ fontSize: s * baseScale }, o.selectionStart, o.selectionEnd);
+      o._forceClearCache = true; o.dirty = true;
+    } else {
+      o.set({ fontSize: s * baseScale, scaleX: 1, scaleY: 1 });
+    }
+  });
 });
 
 pColor.addEventListener("input", () => {
-  const o = active(); if (!o) return;
-  if (o.isEditing && o.selectionStart !== o.selectionEnd) {
-    o.setSelectionStyles({ fill: pColor.value }, o.selectionStart, o.selectionEnd);
-    o._forceClearCache = true; o.dirty = true; fc.requestRenderAll();
-  } else {
-    o.set("fill", pColor.value); fc.renderAll();
-  }
+  _applyToAll(o => {
+    if (!_multiSelectMode && o.isEditing && o.selectionStart !== o.selectionEnd) {
+      o.setSelectionStyles({ fill: pColor.value }, o.selectionStart, o.selectionEnd);
+      o._forceClearCache = true; o.dirty = true;
+    } else {
+      o.set("fill", pColor.value);
+    }
+  });
 });
+
 pFont.addEventListener("change", () => {
-  const o = active(); if (!o) return;
-  if (o.isEditing && o.selectionStart !== o.selectionEnd) {
-    o.setSelectionStyles({ fontFamily: pFont.value }, o.selectionStart, o.selectionEnd);
-    o._forceClearCache = true; o.dirty = true; fc.requestRenderAll();
-  } else {
-    o.set("fontFamily", pFont.value); fc.renderAll();
-  }
+  _applyToAll(o => {
+    if (!_multiSelectMode && o.isEditing && o.selectionStart !== o.selectionEnd) {
+      o.setSelectionStyles({ fontFamily: pFont.value }, o.selectionStart, o.selectionEnd);
+      o._forceClearCache = true; o.dirty = true;
+    } else {
+      o.set("fontFamily", pFont.value);
+    }
+  });
 });
 
 // Prevent style controls from stealing focus (preserves text selection in textbox)
@@ -1058,44 +1303,166 @@ function _applyPartialStyle(prop, boldVal, normalVal) {
 }
 
 pBold.addEventListener("click", () => {
-  _applyPartialStyle("fontWeight", "bold", "normal");
-  const o = active();
-  if (o) pBold.classList.toggle("active", o.fontWeight === "bold");
+  if (_multiSelectMode) {
+    const objs = _getSelectedTextObjects();
+    const allBold = objs.every(o => o.fontWeight === "bold");
+    const newVal = allBold ? "normal" : "bold";
+    objs.forEach(o => o.set("fontWeight", newVal));
+    fc.requestRenderAll();
+    pBold.classList.toggle("active", newVal === "bold");
+  } else {
+    _applyPartialStyle("fontWeight", "bold", "normal");
+    const o = active();
+    if (o) pBold.classList.toggle("active", o.fontWeight === "bold");
+  }
 });
 pItalic.addEventListener("click", () => {
-  _applyPartialStyle("fontStyle", "italic", "normal");
-  const o = active();
-  if (o) pItalic.classList.toggle("active", o.fontStyle === "italic");
+  if (_multiSelectMode) {
+    const objs = _getSelectedTextObjects();
+    const allItalic = objs.every(o => o.fontStyle === "italic");
+    const newVal = allItalic ? "normal" : "italic";
+    objs.forEach(o => o.set("fontStyle", newVal));
+    fc.requestRenderAll();
+    pItalic.classList.toggle("active", newVal === "italic");
+  } else {
+    _applyPartialStyle("fontStyle", "italic", "normal");
+    const o = active();
+    if (o) pItalic.classList.toggle("active", o.fontStyle === "italic");
+  }
 });
 pUnderline.addEventListener("click", () => {
+  if (_multiSelectMode) {
+    const objs = _getSelectedTextObjects();
+    const allUl = objs.every(o => !!o.underline);
+    const newVal = !allUl;
+    objs.forEach(o => o.set("underline", newVal));
+    fc.requestRenderAll();
+    pUnderline.classList.toggle("active", newVal);
+  } else {
+    const o = active(); if (!o) return;
+    const start = o.selectionStart;
+    const end = o.selectionEnd;
+    if (o.isEditing && start !== end) {
+      let allUl = true;
+      for (let i = start; i < end; i++) {
+        const s = o.getStyleAtPosition(i);
+        if (!s || !s.underline) { allUl = false; break; }
+      }
+      const newVal = !allUl;
+      o.setSelectionStyles({ underline: newVal }, start, end);
+      o._forceClearCache = true;
+      o.dirty = true;
+      fc.requestRenderAll();
+    } else {
+      o.set("underline", !o.underline);
+      fc.requestRenderAll();
+    }
+    pUnderline.classList.toggle("active", !!o.underline);
+  }
+});
+
+function _applyScriptStyle(direction) {
+  // direction: "super" or "sub"
   const o = active(); if (!o) return;
   const start = o.selectionStart;
   const end = o.selectionEnd;
-  if (o.isEditing && start !== end) {
-    let allUl = true;
-    for (let i = start; i < end; i++) {
-      const s = o.getStyleAtPosition(i);
-      if (!s || !s.underline) { allUl = false; break; }
-    }
-    const newVal = !allUl;
-    o.setSelectionStyles({ underline: newVal }, start, end);
-    o._forceClearCache = true;
-    o.dirty = true;
-    fc.requestRenderAll();
-  } else {
-    o.set("underline", !o.underline);
-    fc.requestRenderAll();
+  if (!o.isEditing || start === end) return;
+
+  const baseFontSize = o.fontSize;
+  let allApplied = true;
+  for (let i = start; i < end; i++) {
+    const s = o.getStyleAtPosition(i);
+    const dy = (s && s.deltaY) || 0;
+    if (direction === "super" && !(dy < 0)) { allApplied = false; break; }
+    if (direction === "sub" && !(dy > 0)) { allApplied = false; break; }
   }
-  pUnderline.classList.toggle("active", !!o.underline);
+
+  for (let i = start; i < end; i++) {
+    const s = o.getStyleAtPosition(i);
+    const charSize = (s && s.fontSize) || baseFontSize;
+    if (allApplied) {
+      // Toggle off: restore size and reset baseline
+      const wasScaled = (s && s.deltaY) ? true : false;
+      const restored = wasScaled ? Math.round(charSize / 0.58) : charSize;
+      o.setSelectionStyles({ fontSize: restored, deltaY: 0 }, i, i + 1);
+    } else {
+      // Check if opposite script is applied
+      const dy = (s && s.deltaY) || 0;
+      const isAlreadyScripted = dy !== 0;
+      const size = isAlreadyScripted ? Math.round(charSize / 0.58) : charSize;
+      const newSize = Math.round(size * 0.58);
+      const shift = Math.round(size * 0.4);
+      o.setSelectionStyles({
+        fontSize: newSize,
+        deltaY: direction === "super" ? -shift : shift,
+      }, i, i + 1);
+    }
+  }
+  o._forceClearCache = true;
+  o.dirty = true;
+  fc.requestRenderAll();
+}
+
+pSuperscript.addEventListener("click", () => {
+  _applyScriptStyle("super");
+  pSuperscript.classList.toggle("active");
+  pSubscript.classList.remove("active");
+});
+
+pSubscript.addEventListener("click", () => {
+  _applyScriptStyle("sub");
+  pSubscript.classList.toggle("active");
+  pSuperscript.classList.remove("active");
+});
+
+document.querySelectorAll(".align-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    _applyToAll(o => o.set("textAlign", btn.dataset.align));
+    document.querySelectorAll(".align-btn").forEach(b => b.classList.toggle("active", b.dataset.align === btn.dataset.align));
+  });
 });
 
 pOpacity.addEventListener("input", () => {
-  const o = active(); if (!o) return;
-  o.set("opacity", parseInt(pOpacity.value, 10) / 100);
-  pOpacityVal.textContent = pOpacity.value; fc.renderAll();
+  _applyToAll(o => o.set("opacity", parseInt(pOpacity.value, 10) / 100));
+  pOpacityVal.textContent = pOpacity.value;
 });
 pX.addEventListener("change", () => { const o = active(); if (!o) return; o.set("left", parseInt(pX.value, 10) * baseScale); fc.renderAll(); });
 pY.addEventListener("change", () => { const o = active(); if (!o) return; o.set("top", parseInt(pY.value, 10) * baseScale); fc.renderAll(); });
+
+// ── Multi-select: Match Font Size & Style ──
+btnMatchSize.addEventListener("click", () => {
+  const sel = fc.getActiveObject();
+  if (!sel || sel.type !== "activeSelection") return;
+  const objs = sel.getObjects().filter(o => o.type === "textbox" || o.type === "i-text");
+  if (objs.length < 2) return;
+  // Find the smallest font size (in real px, accounting for scale)
+  const sizes = objs.map(o => Math.round(o.fontSize * o.scaleY / baseScale));
+  const minSize = Math.min(...sizes);
+  objs.forEach(o => {
+    o.set({ fontSize: minSize * baseScale, scaleX: 1, scaleY: 1 });
+  });
+  fc.requestRenderAll();
+  refreshLayers();
+});
+
+btnMatchStyle.addEventListener("click", () => {
+  const sel = fc.getActiveObject();
+  if (!sel || sel.type !== "activeSelection") return;
+  const objs = sel.getObjects().filter(o => o.type === "textbox" || o.type === "i-text");
+  if (objs.length < 2) return;
+  // Copy style from first selected object to all others
+  const src = objs[0];
+  const style = {
+    fontWeight: src.fontWeight,
+    fontStyle: src.fontStyle,
+    underline: src.underline,
+    fontFamily: src.fontFamily,
+    fill: src.fill,
+  };
+  objs.forEach(o => o.set(style));
+  fc.requestRenderAll();
+  refreshLayers();
+});
 
 function active() {
   let o = fc ? fc.getActiveObject() : null;
@@ -1150,7 +1517,7 @@ lDel.addEventListener("click", () => {
 btnBack.addEventListener("click", () => setPhase("review"));
 
 btnTogglePreview.addEventListener("click", () => {
-  edPreviewPanel.classList.toggle("hidden");
+  edPreviewPanel.classList.toggle("ed-pane-hidden");
   btnTogglePreview.classList.toggle("tb-active");
 });
 

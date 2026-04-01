@@ -111,9 +111,17 @@ def detect_text(image_bytes: bytes) -> list[dict]:
         for block in page.blocks:
             for paragraph in block.paragraphs:
                 text = ""
+                word_heights = []
                 for word in paragraph.words:
                     word_text = "".join(s.text for s in word.symbols)
                     text += word_text + " "
+                    # Measure word bounding box height for font size estimation
+                    wv = word.bounding_box.vertices
+                    if wv:
+                        wys = [v.y for v in wv]
+                        wh = max(wys) - min(wys)
+                        if wh > 0:
+                            word_heights.append(wh)
                 text = text.strip()
                 if not text:
                     continue
@@ -143,8 +151,15 @@ def detect_text(image_bytes: bytes) -> list[dict]:
                     print(f"[OCR SKIP] icon filter: {box_w}x{box_h} area={area} aspect={aspect:.2f} words={word_count} — '{text[:50]}'")
                     continue
 
-                print(f"[OCR KEEP] {box_w}x{box_h} area={area} — '{text[:60]}'")
-                regions.append({"text": text, "vertices": vertices})
+                # Estimate font size from median word height
+                median_word_h = 0
+                if word_heights:
+                    sorted_wh = sorted(word_heights)
+                    mid = len(sorted_wh) // 2
+                    median_word_h = sorted_wh[mid] if len(sorted_wh) % 2 else (sorted_wh[mid - 1] + sorted_wh[mid]) // 2
+
+                print(f"[OCR KEEP] {box_w}x{box_h} area={area} wordH={median_word_h} — '{text[:60]}'")
+                regions.append({"text": text, "vertices": vertices, "word_height": median_word_h})
 
     return regions
 
@@ -413,8 +428,8 @@ def detect_italic(
 
     # Linear regression: if slope is significant, text is slanted (italic)
     slope, _, r_value, _, _ = stats.linregress(row_indices, centroids)
-    # Italic text has a consistent rightward slant with good correlation
-    return abs(slope) > 0.12 and abs(r_value) > 0.5
+    # Strict thresholds to avoid false positives — real italic has strong consistent slant
+    return abs(slope) > 0.25 and abs(r_value) > 0.7
 
 
 def detect_font_family(
@@ -577,8 +592,35 @@ def get_font(
 
 # ── Text rendering helpers (pixel-accurate) ──────────────────────────────
 
+def _is_cjk_char(ch: str) -> bool:
+    """Check if a character is CJK (Chinese, Japanese, Korean)."""
+    cp = ord(ch)
+    return any((
+        0x4E00 <= cp <= 0x9FFF,    # CJK Unified Ideographs
+        0x3400 <= cp <= 0x4DBF,    # CJK Extension A
+        0x3000 <= cp <= 0x303F,    # CJK Symbols and Punctuation
+        0x3040 <= cp <= 0x309F,    # Hiragana
+        0x30A0 <= cp <= 0x30FF,    # Katakana
+        0xAC00 <= cp <= 0xD7AF,    # Hangul Syllables
+        0xFF00 <= cp <= 0xFFEF,    # Fullwidth Forms
+        0x20000 <= cp <= 0x2A6DF,  # CJK Extension B
+    ))
+
+
+def _has_cjk(text: str) -> bool:
+    """Check if text contains any CJK characters."""
+    return any(_is_cjk_char(ch) for ch in text)
+
+
 def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-    """Word-based wrapping using Pillow's getbbox for pixel accuracy."""
+    """Word-based wrapping with CJK character-level breaking."""
+    if not text.strip():
+        return [text]
+
+    if _has_cjk(text):
+        return _wrap_text_cjk(text, font, max_width)
+
+    # Standard space-based wrapping for non-CJK text
     words = text.split()
     if not words:
         return [text]
@@ -599,15 +641,122 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[
     return lines if lines else [text]
 
 
+def _wrap_text_cjk(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
+    """Character-level wrapping for CJK text. Breaks between any CJK chars."""
+    lines = []
+    current = ""
+    for ch in text:
+        test = current + ch
+        bbox = font.getbbox(test)
+        w = bbox[2] - bbox[0]
+        if w <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = ch
+    if current:
+        lines.append(current)
+    return lines if lines else [text]
+
+
 def _line_height(font: ImageFont.FreeTypeFont) -> int:
     """Compute line height from font metrics."""
     bbox = font.getbbox("Ayg|")
     return (bbox[3] - bbox[1]) + 2
 
 
-def _fit_font_size(text: str, target_lang: str, box_w: int, box_h: int, bold: bool = False) -> int:
-    """Binary search for the largest font size where text fits the box."""
-    lo, hi = 6, max(box_h, 10)
+def _estimate_original_font_size(orig_text: str, box_h: int, word_height: int = 0) -> int:
+    """Estimate the original font size from word-level bounding box height.
+
+    word_height is the median height of word bounding boxes from OCR,
+    which directly approximates the font size in pixels.
+    Falls back to box_h / line_count heuristic if word_height is unavailable.
+    """
+    if word_height > 0:
+        # Word bbox height ≈ font size (slightly larger due to ascenders/descenders)
+        return max(6, int(word_height * 0.85))
+    # Fallback: estimate from paragraph box height
+    line_count = max(1, orig_text.count("\n") + 1)
+    words = orig_text.split()
+    if line_count == 1 and len(words) > 6:
+        line_count = max(1, len(words) // 4)
+    estimated = int(box_h / line_count / 1.2)
+    return max(6, estimated)
+
+
+def _normalize_font_sizes(layers: list[dict], proximity: int = 200, size_tolerance: float = 0.3):
+    """Group spatially close regions with similar original font sizes and normalize.
+
+    Regions are grouped if:
+    - Their bounding boxes are within `proximity` pixels of each other
+    - Their originalFontSize values are within `size_tolerance` ratio of each other
+
+    All regions in a group get the minimum fontSize in the group,
+    ensuring consistent sizing for text from the same visual section.
+    """
+    if not layers:
+        return
+
+    n = len(layers)
+    visited = [False] * n
+
+    for i in range(n):
+        if visited[i]:
+            continue
+        # BFS to find all connected regions in this group
+        group = [i]
+        visited[i] = True
+        queue = [i]
+        while queue:
+            cur = queue.pop(0)
+            cx = layers[cur]["x"] + layers[cur]["width"] / 2
+            cy = layers[cur]["y"] + layers[cur]["height"] / 2
+            cur_orig_size = layers[cur].get("originalFontSize", 0)
+            for j in range(n):
+                if visited[j]:
+                    continue
+                jx = layers[j]["x"] + layers[j]["width"] / 2
+                jy = layers[j]["y"] + layers[j]["height"] / 2
+                dist = max(abs(cx - jx), abs(cy - jy))  # Chebyshev distance
+                j_orig_size = layers[j].get("originalFontSize", 0)
+                # Check proximity and similar original font size
+                if dist < proximity and cur_orig_size > 0 and j_orig_size > 0:
+                    ratio = min(cur_orig_size, j_orig_size) / max(cur_orig_size, j_orig_size)
+                    if ratio >= (1 - size_tolerance):
+                        visited[j] = True
+                        group.append(j)
+                        queue.append(j)
+
+        if len(group) > 1:
+            min_size = min(layers[idx]["fontSize"] for idx in group)
+            orig_sizes = [layers[idx].get("originalFontSize", 0) for idx in group]
+            # Use majority vote for bold/italic/underline
+            bold_votes = sum(1 for idx in group if layers[idx].get("bold"))
+            italic_votes = sum(1 for idx in group if layers[idx].get("italic"))
+            underline_votes = sum(1 for idx in group if layers[idx].get("underline"))
+            majority = len(group) / 2
+            group_bold = bold_votes > majority
+            group_italic = italic_votes > majority
+            group_underline = underline_votes > majority
+            print(f"[NORMALIZE] group of {len(group)}: origSizes={orig_sizes} → {min_size}px, bold={group_bold}, italic={group_italic}")
+            for idx in group:
+                layers[idx]["fontSize"] = min_size
+                layers[idx]["bold"] = group_bold
+                layers[idx]["italic"] = group_italic
+                layers[idx]["underline"] = group_underline
+
+
+def _fit_font_size(text: str, target_lang: str, box_w: int, box_h: int,
+                   bold: bool = False, max_size: int = 0) -> int:
+    """Binary search for the largest font size where text fits the box.
+
+    If max_size > 0, the result will not exceed max_size (original font size cap).
+    """
+    upper = max(box_h, 10)
+    if max_size > 0:
+        upper = min(upper, max_size)
+    lo, hi = 6, upper
     best = lo
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -1053,7 +1202,10 @@ async def phase1_clean(request: Request):
             fit_w, fit_h = h, w
         else:
             fit_w, fit_h = w, h
-        font_size = _fit_font_size(trans_text, target_lang, fit_w, fit_h, bold=is_bold)
+        word_h = r.get("word_height", 0)
+        orig_font_size = _estimate_original_font_size(orig_text, fit_h, word_h)
+        font_size = _fit_font_size(trans_text, target_lang, fit_w, fit_h,
+                                   bold=is_bold, max_size=orig_font_size)
         hex_color = "#{:02x}{:02x}{:02x}".format(*color)
 
         layer_data.append({
@@ -1064,6 +1216,7 @@ async def phase1_clean(request: Request):
             "fitWidth": fit_w,
             "fitHeight": fit_h,
             "fontSize": font_size,
+            "originalFontSize": orig_font_size,
             "color": hex_color,
             "bold": is_bold,
             "italic": is_italic,
@@ -1072,6 +1225,9 @@ async def phase1_clean(request: Request):
             "alignment": alignment,
             "angle": angle,
         })
+
+    # ── Post-process: normalize font sizes for spatially grouped regions ──
+    _normalize_font_sizes(layer_data)
 
     return JSONResponse(content={
         "original": original_image,
