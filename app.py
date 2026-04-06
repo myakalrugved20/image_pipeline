@@ -640,6 +640,39 @@ def detect_font_styles_docai(image_bytes: bytes) -> dict | None:
         return None
 
 
+def _find_text_fuzzy(full_text: str, search: str) -> int:
+    """Find substring in full_text with fuzzy matching.
+
+    Tries: exact → case-insensitive → newline-normalized + case-insensitive.
+    Returns the index in the ORIGINAL full_text.
+    """
+    # Exact match
+    idx = full_text.find(search)
+    if idx != -1:
+        return idx
+    # Case-insensitive
+    idx = full_text.lower().find(search.lower())
+    if idx != -1:
+        return idx
+    # Normalize newlines to spaces and try case-insensitive
+    normalized = full_text.replace("\n", " ").replace("  ", " ")
+    search_norm = search.replace("\n", " ").replace("  ", " ")
+    norm_idx = normalized.lower().find(search_norm.lower())
+    if norm_idx != -1:
+        # Map normalized index back to original full_text index
+        # Count how many chars in original up to the same logical position
+        orig_idx = 0
+        norm_pos = 0
+        while norm_pos < norm_idx and orig_idx < len(full_text):
+            if full_text[orig_idx] == "\n":
+                # newline became space in normalized — still counts as 1 char
+                pass
+            orig_idx += 1
+            norm_pos += 1
+        return orig_idx
+    return -1
+
+
 def match_region_style(region_text: str, docai_data: dict | None) -> dict | None:
     """Match an OCR region's text to Document AI style data.
 
@@ -651,20 +684,20 @@ def match_region_style(region_text: str, docai_data: dict | None) -> dict | None
     full_text = docai_data["full_text"]
     styles = docai_data["styles"]
 
-    # Try to find the region text in Azure's full text (fuzzy: ignore whitespace differences)
+    # Try to find the region text (fuzzy: ignore whitespace and case differences)
     region_clean = region_text.strip().replace("  ", " ")
 
     # Collect all styles that overlap with this region's text
     matching_styles = []
 
-    # Try exact substring match first
-    idx = full_text.find(region_clean)
+    # Try substring match (exact then case-insensitive)
+    idx = _find_text_fuzzy(full_text, region_clean)
     if idx == -1:
         # Try matching first few words
         words = region_clean.split()
         if len(words) >= 2:
             prefix = " ".join(words[:3])
-            idx = full_text.find(prefix)
+            idx = _find_text_fuzzy(full_text, prefix)
 
     if idx == -1:
         return None
@@ -746,12 +779,12 @@ def match_region_style_spans(region_text: str, docai_data: dict | None) -> list[
     styles = docai_data["styles"]
 
     region_clean = region_text.strip().replace("  ", " ")
-    idx = full_text.find(region_clean)
+    idx = _find_text_fuzzy(full_text, region_clean)
     if idx == -1:
         words = region_clean.split()
         if len(words) >= 2:
             prefix = " ".join(words[:3])
-            idx = full_text.find(prefix)
+            idx = _find_text_fuzzy(full_text, prefix)
     if idx == -1:
         return None
 
@@ -1201,13 +1234,17 @@ def _line_height(font: ImageFont.FreeTypeFont) -> int:
     return (bbox[3] - bbox[1]) + 2
 
 
-def _estimate_original_font_size(orig_text: str, box_h: int, word_height: int = 0) -> int:
-    """Estimate the original font size from word-level bounding box height.
+def _estimate_original_font_size(orig_text: str, box_h: int, word_height: int = 0,
+                                  docai_font_size: int | None = None) -> int:
+    """Estimate the original font size from the best available source.
 
-    word_height is the median height of word bounding boxes from OCR,
-    which directly approximates the font size in pixels.
-    Falls back to box_h / line_count heuristic if word_height is unavailable.
+    Priority:
+    1. Document AI pixel_font_size (weighted average across matched tokens)
+    2. word_height from OCR (median word bounding box height)
+    3. box_h / line_count heuristic
     """
+    if docai_font_size and docai_font_size > 0:
+        return max(6, int(docai_font_size))
     if word_height > 0:
         # Word bbox height ≈ font size (slightly larger due to ascenders/descenders)
         return max(6, int(word_height * 0.85))
@@ -1220,7 +1257,7 @@ def _estimate_original_font_size(orig_text: str, box_h: int, word_height: int = 
     return max(6, estimated)
 
 
-def _normalize_font_sizes(layers: list[dict], proximity: int = 120, size_tolerance: float = 0.30):
+def _normalize_font_sizes(layers: list[dict], target_lang: str = "", proximity: int = 120, size_tolerance: float = 0.30):
     """Group spatially close regions with similar original font sizes and normalize.
 
     Regions are grouped if:
@@ -1240,14 +1277,17 @@ def _normalize_font_sizes(layers: list[dict], proximity: int = 120, size_toleran
         if visited[i]:
             continue
         # BFS to find all connected regions in this group
+        # Check new candidates against the group's min/max size range
+        # to prevent BFS chaining (A→B→C where A and C are too different)
         group = [i]
         visited[i] = True
         queue = [i]
+        group_min_size = layers[i].get("originalFontSize", 0)
+        group_max_size = group_min_size
         while queue:
             cur = queue.pop(0)
             cx = layers[cur]["x"] + layers[cur]["width"] / 2
             cy = layers[cur]["y"] + layers[cur]["height"] / 2
-            cur_orig_size = layers[cur].get("originalFontSize", 0)
             for j in range(n):
                 if visited[j]:
                     continue
@@ -1255,18 +1295,24 @@ def _normalize_font_sizes(layers: list[dict], proximity: int = 120, size_toleran
                 jy = layers[j]["y"] + layers[j]["height"] / 2
                 dist = max(abs(cx - jx), abs(cy - jy))  # Chebyshev distance
                 j_orig_size = layers[j].get("originalFontSize", 0)
-                # Check proximity and similar original font size
-                if dist < proximity and cur_orig_size > 0 and j_orig_size > 0:
-                    ratio = min(cur_orig_size, j_orig_size) / max(cur_orig_size, j_orig_size)
+                if dist < proximity and j_orig_size > 0 and group_min_size > 0:
+                    # Check against the group's full range, not just the current node
+                    new_min = min(group_min_size, j_orig_size)
+                    new_max = max(group_max_size, j_orig_size)
+                    ratio = new_min / new_max if new_max > 0 else 1
                     if ratio >= (1 - size_tolerance):
                         visited[j] = True
                         group.append(j)
                         queue.append(j)
+                        group_min_size = new_min
+                        group_max_size = new_max
 
         if len(group) > 1:
-            sorted_sizes = sorted(layers[idx]["fontSize"] for idx in group)
-            min_size = sorted_sizes[len(sorted_sizes) // 2]  # median
             orig_sizes = [layers[idx].get("originalFontSize", 0) for idx in group]
+            # Use median of originalFontSize as the target size for the group
+            sorted_orig = sorted(orig_sizes)
+            target_orig_size = sorted_orig[len(sorted_orig) // 2]
+
             # Use majority vote for bold/italic/underline
             bold_votes = sum(1 for idx in group if layers[idx].get("bold"))
             italic_votes = sum(1 for idx in group if layers[idx].get("italic"))
@@ -1275,12 +1321,21 @@ def _normalize_font_sizes(layers: list[dict], proximity: int = 120, size_toleran
             group_bold = bold_votes > majority
             group_italic = italic_votes > majority
             group_underline = underline_votes > majority
-            print(f"[NORMALIZE] group of {len(group)}: origSizes={orig_sizes} → {min_size}px, bold={group_bold}, italic={group_italic}")
+
+            # Re-fit each layer's font size using the group's target original size as max
+            print(f"[NORMALIZE] group of {len(group)}: origSizes={orig_sizes} → target={target_orig_size}px, bold={group_bold}, italic={group_italic}")
             for idx in group:
-                layers[idx]["fontSize"] = min_size
-                layers[idx]["bold"] = group_bold
-                layers[idx]["italic"] = group_italic
-                layers[idx]["underline"] = group_underline
+                l = layers[idx]
+                fit_w = l.get("fitWidth", l["width"])
+                fit_h = l.get("fitHeight", l["height"])
+                text = l.get("translatedText", "")
+                new_size = _fit_font_size(text, target_lang, fit_w, fit_h,
+                                          bold=group_bold, max_size=target_orig_size)
+                l["fontSize"] = new_size
+                l["originalFontSize"] = target_orig_size
+                l["bold"] = group_bold
+                l["italic"] = group_italic
+                l["underline"] = group_underline
 
 
 def _fit_font_size(text: str, target_lang: str, box_w: int, box_h: int,
@@ -1789,10 +1844,12 @@ async def phase1_clean(request: Request):
             fit_w, fit_h = h, w
         else:
             fit_w, fit_h = w, h
-        # Estimate original font size from bounding box dimensions
-        # (Document AI pixel_font_size is typographic, not rendered size — don't use as cap)
+        # Estimate original font size — prefer Document AI pixel_font_size when available
         word_h = r.get("word_height", 0)
-        orig_font_size = _estimate_original_font_size(orig_text, fit_h, word_h)
+        docai_fs = style.get("_docai_font_size")
+        orig_font_size = _estimate_original_font_size(orig_text, fit_h, word_h,
+                                                       docai_font_size=docai_fs)
+        print(f"[FontSize] '{orig_text[:40]}' → origFS={orig_font_size} (docai={docai_fs}, wordH={word_h}, boxH={fit_h})")
         font_size = _fit_font_size(trans_text, target_lang, fit_w, fit_h,
                                    bold=is_bold, max_size=orig_font_size)
         hex_color = "#{:02x}{:02x}{:02x}".format(*color)
@@ -1824,7 +1881,7 @@ async def phase1_clean(request: Request):
         })
 
     # ── Post-process: normalize font sizes for spatially grouped regions ──
-    _normalize_font_sizes(layer_data)
+    _normalize_font_sizes(layer_data, target_lang=target_lang)
 
     return JSONResponse(content={
         "original": original_image,

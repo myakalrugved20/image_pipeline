@@ -55,8 +55,8 @@ python app.py
 - **Color noise filtering**: Document AI per-token colors are noisy (affected by background/anti-aliasing). Per-word color is only applied when spans have truly distinct colors (RGB Manhattan distance > 150), otherwise the single K-means region color is used.
 - **Non-Latin font safety**: `get_font()` forces `sans-serif` for non-Latin-script languages (Hindi, Bengali, etc.) because `NotoSerif-Regular.ttf` lacks Devanagari glyphs — prevents tofu (□□□□) rendering.
 - **Alignment detection**: Heuristic based on bounding box x-position relative to image width
-- **Font sizing**: Binary search for largest font size where wrapped text fits bounding box
-- **Font size normalization**: Spatially close regions with similar original font sizes (within 30% tolerance, 120px proximity) are grouped and normalized to median size for visual consistency (e.g., bullet list items).
+- **Font sizing**: Binary search for largest font size where wrapped text fits bounding box. Uses Document AI `pixel_font_size` as primary estimate, falls back to OCR `wordH * 0.85`, then `boxH / line_count` heuristic.
+- **Font size normalization**: Spatially close regions with similar original font sizes (within 30% tolerance, 120px proximity) are grouped and re-fitted to the median `originalFontSize`. BFS anti-chaining prevents snowball grouping by checking new candidates against the group's full min/max range.
 - **Variable fonts**: Noto Sans supports weight axis — bold via `font.set_variation_by_name("Bold")`
 - **Base64 data URLs**: Images passed between frontend and backend as `data:image/png;base64,...`
 
@@ -66,6 +66,7 @@ python app.py
 - **API**: Uses `documentai_v1.DocumentProcessorServiceClient` with `OcrConfig.PremiumFeatures(compute_style_info=True)`
 - **Fallback**: When Document AI is not configured, falls back to pixel-based K-means bold/color detection
 - **Token data used**: `style_info.bold`, `style_info.font_weight`, `style_info.pixel_font_size`, `style_info.text_color`, `style_info.italic`, `style_info.font_type`
+- **Text matching**: `_find_text_fuzzy()` matches OCR region text to Document AI full text with exact → case-insensitive → newline-normalized fallbacks (handles Cloud Vision vs Document AI whitespace/case differences)
 
 ## Sensitive Files
 - `my-project-20223-*.json` — Google Cloud service account key (not currently used, switched to ADC)
