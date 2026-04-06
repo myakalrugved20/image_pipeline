@@ -963,6 +963,7 @@ function buildCanvas(data) {
         _boxW:      l.width,
         _boxH:      l.height,
         _alignment: alignment,
+        _styleSpans: l.styleSpans || null,
         left:       l.x * baseScale,
         top:        l.y * baseScale,
       };
@@ -976,6 +977,99 @@ function buildCanvas(data) {
       }
 
       const t = new fabric.Textbox(_addCJKBreaks(l.translatedText), opts);
+
+      // Apply per-character styles from Document AI styleSpans
+      if (l.styleSpans && l.styleSpans.length > 0) {
+        const fullText = t.text;
+        const totalLen = fullText.length;
+
+        // Check if spans have significantly different colors (not just noise)
+        const parseHex = (h) => {
+          if (!h || !h.startsWith("#") || h.length !== 7) return null;
+          return [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
+        };
+        const spanColors = l.styleSpans.map(s => parseHex(s.color)).filter(Boolean);
+        let hasDistinctColors = false;
+        if (spanColors.length >= 2) {
+          for (let i = 0; i < spanColors.length && !hasDistinctColors; i++) {
+            for (let j = i + 1; j < spanColors.length; j++) {
+              const dist = Math.abs(spanColors[i][0]-spanColors[j][0])
+                         + Math.abs(spanColors[i][1]-spanColors[j][1])
+                         + Math.abs(spanColors[i][2]-spanColors[j][2]);
+              if (dist > 150) { hasDistinctColors = true; break; }
+            }
+          }
+        }
+
+        // Build per-character style array from proportional spans
+        // Use ci/totalLen so prop stays in [0, 1) — avoids off-by-one at end
+        const charStyles = [];
+        for (let ci = 0; ci < totalLen; ci++) {
+          const prop = totalLen > 0 ? ci / totalLen : 0;
+          let matched = l.styleSpans[l.styleSpans.length - 1]; // default to last span
+          for (const span of l.styleSpans) {
+            if (span.start <= prop && prop < span.end) {
+              matched = span;
+              break;
+            }
+          }
+          charStyles.push(matched);
+        }
+        // Helper: check if a Unicode char is a combining/dependent mark
+        // (Devanagari vowel signs, anusvara, visarga, nukta, virama, etc.)
+        function _isCombining(ch) {
+          const cp = ch.codePointAt(0);
+          if (!cp) return false;
+          // Unicode combining marks (general)
+          if (cp >= 0x0300 && cp <= 0x036F) return true;
+          // Devanagari dependent signs (vowel signs, anusvara, visarga, nukta, virama)
+          if (cp >= 0x0900 && cp <= 0x0903) return true;  // chandrabindu, anusvara, visarga
+          if (cp >= 0x093A && cp <= 0x094F) return true;  // nukta, vowel signs, virama
+          if (cp >= 0x0951 && cp <= 0x0957) return true;  // stress marks
+          if (cp >= 0x0962 && cp <= 0x0963) return true;  // vowel signs
+          // Zero-width joiners
+          if (cp === 0x200C || cp === 0x200D) return true;
+          return false;
+        }
+
+        // Build Fabric.js styles object keyed by unwrapped line index
+        // (Fabric 5.x Textbox: line 0 = all chars before first \n, survives reflow)
+        // Combining characters inherit the style of their preceding base character
+        const fabricStyles = {};
+        let lineIdx = 0, charIdx = 0;
+        let lastCharStyle = null;
+        for (let ci = 0; ci < totalLen; ci++) {
+          if (fullText[ci] === "\n") {
+            lineIdx++;
+            charIdx = 0;
+            lastCharStyle = null;
+            continue;
+          }
+          let charStyle;
+          if (_isCombining(fullText[ci]) && lastCharStyle) {
+            // Combining mark: inherit style from preceding base character
+            charStyle = Object.assign({}, lastCharStyle);
+          } else {
+            const span = charStyles[ci];
+            charStyle = {};
+            if (span.fontWeight === "bold") charStyle.fontWeight = "bold";
+            if (span.fontStyle === "italic") charStyle.fontStyle = "italic";
+            // Only apply per-char color when spans have truly distinct colors
+            if (hasDistinctColors && span.color) charStyle.fill = span.color;
+            lastCharStyle = Object.keys(charStyle).length > 0 ? charStyle : null;
+          }
+          if (charStyle && Object.keys(charStyle).length > 0) {
+            if (!fabricStyles[lineIdx]) fabricStyles[lineIdx] = {};
+            fabricStyles[lineIdx][charIdx] = charStyle;
+          }
+          charIdx++;
+        }
+        t.styles = fabricStyles;
+        console.log("[StyleSpans]", l.translatedText.substring(0, 40),
+          "spans:", l.styleSpans.length,
+          "boldChars:", Object.values(fabricStyles[0] || {}).filter(s => s.fontWeight === "bold").length,
+          "totalChars:", totalLen);
+      }
 
       // Trust server's font size but shrink if browser renders larger than bounding box
       t._clearCache();
@@ -1629,7 +1723,7 @@ workspace.addEventListener("wheel", e => {
 // ══════════════════════════════════════════════════════════════════════════
 // Export → Phase 4 (server-side render)
 // ══════════════════════════════════════════════════════════════════════════
-btnExport.addEventListener("click", () => {
+btnExport.addEventListener("click", async () => {
   if (!fc || !phaseData) return;
 
   fc.discardActiveObject(); fc.renderAll();
@@ -1639,13 +1733,63 @@ btnExport.addEventListener("click", () => {
   p3Loading.classList.remove("hidden");
   p3Content.classList.add("hidden");
 
-  // Render canvas at full original resolution (client-side)
-  // This guarantees the output matches the editor exactly
-  const multiplier = 1 / (baseScale * zoomLevel);
-  const dataUrl = fc.toDataURL({ format: "png", multiplier: multiplier });
+  // Build layer JSON from Fabric.js objects for server-side render
+  const layers = [];
+  fc.getObjects().forEach(o => {
+    if (o.type !== "textbox" || o.excludeFromExport) return;
+    const scX = o.scaleX || 1;
+    const scY = o.scaleY || 1;
+    const realFontSize = (o.fontSize || 16) * scX / baseScale;
+    const realW = (o.width || 100) * scX / baseScale;
+    const realH = (o.calcTextHeight ? o.calcTextHeight() : (o.height || 50)) * scY / baseScale;
+    let realX, realY;
+    if (o.originX === "center") {
+      realX = o.left / baseScale - realW / 2;
+      realY = o.top / baseScale - realH / 2;
+    } else {
+      realX = o.left / baseScale;
+      realY = o.top / baseScale;
+    }
+    layers.push({
+      text:       o.text,
+      x:          Math.round(realX),
+      y:          Math.round(realY),
+      width:      Math.round(realW),
+      height:     Math.round(realH),
+      fontSize:   Math.round(realFontSize),
+      color:      rgbToHex(o.fill),
+      opacity:    o.opacity || 1,
+      fontWeight: o.fontWeight || "normal",
+      fontStyle:  o.fontStyle || "normal",
+      fontFamily: o.fontFamily || "sans-serif",
+      underline:  !!o.underline,
+      alignment:  o.textAlign || "center",
+      angle:      o.angle || 0,
+      styleSpans: o._styleSpans || null,
+    });
+  });
 
-  p3Original.src = phaseData.original;
-  p3Result.src = dataUrl;
+  try {
+    const fd = new FormData();
+    fd.append("clean_image", phaseData.clean);
+    fd.append("layers_json", JSON.stringify(layers));
+    fd.append("target_lang", targetLang.value);
+
+    const res = await fetch("/phase2-render", { method: "POST", body: fd });
+    if (!res.ok) throw new Error("Render failed: " + res.status);
+    const data = await res.json();
+
+    p3Original.src = phaseData.original;
+    p3Result.src = data.result;
+  } catch (e) {
+    // Fallback to client-side render
+    console.error("Server render failed, using client-side:", e);
+    const multiplier = 1 / (baseScale * zoomLevel);
+    const dataUrl = fc.toDataURL({ format: "png", multiplier: multiplier });
+    p3Original.src = phaseData.original;
+    p3Result.src = dataUrl;
+  }
+
   p3Loading.classList.add("hidden");
   p3Content.classList.remove("hidden");
 });

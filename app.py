@@ -1,9 +1,12 @@
 import os
 import sys
+from dotenv import load_dotenv
+load_dotenv()
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 if sys.stdout.encoding and sys.stdout.encoding.lower().startswith("cp"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+import asyncio
 import io
 import json
 import base64
@@ -69,6 +72,25 @@ def get_lama():
 
 # Google Vision client
 vision_client = vision.ImageAnnotatorClient()
+
+# Google Document AI client (optional — for font style detection)
+_docai_client = None
+_docai_processor = os.environ.get("GOOGLE_DOCAI_PROCESSOR", "")  # e.g. "projects/PROJECT/locations/REGION/processors/PROC_ID"
+
+def get_docai_client():
+    global _docai_client
+    if _docai_client is not None:
+        return _docai_client
+    if _docai_processor:
+        try:
+            from google.cloud import documentai_v1 as documentai
+            _docai_client = documentai.DocumentProcessorServiceClient()
+            print("[DocAI] Client initialized successfully")
+            return _docai_client
+        except Exception as e:
+            print(f"[DocAI] Failed to initialize: {e}")
+            return None
+    return None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -172,8 +194,20 @@ def translate_texts(texts: list[str], source: str, target: str) -> list[str]:
         return []
     try:
         translator = GoogleTranslator(source=source, target=target)
-        results = translator.translate_batch(texts)
-        return [r if r else t for r, t in zip(results, texts)]
+        results = []
+        for t in texts:
+            try:
+                r = translator.translate(t)
+                # Detect error responses returned as "translations"
+                if r and ("Error" in r and "Server Error" in r):
+                    print(f"[TRANSLATE] Error response detected, keeping original: '{t[:40]}'")
+                    results.append(t)
+                else:
+                    results.append(r if r else t)
+            except Exception:
+                print(f"[TRANSLATE] Failed for: '{t[:40]}', keeping original")
+                results.append(t)
+        return results
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Translation error: {exc}")
 
@@ -428,8 +462,9 @@ def detect_italic(
 
     # Linear regression: if slope is significant, text is slanted (italic)
     slope, _, r_value, _, _ = stats.linregress(row_indices, centroids)
-    # Strict thresholds to avoid false positives — real italic has strong consistent slant
-    return abs(slope) > 0.25 and abs(r_value) > 0.7
+    # Very strict thresholds — pixel-based italic detection is unreliable on
+    # gradient/textured backgrounds, so only flag obvious cases
+    return abs(slope) > 0.4 and abs(r_value) > 0.85
 
 
 def detect_font_family(
@@ -495,24 +530,350 @@ def detect_underline(
     threshold = np.percentile(diff.flatten(), 60)
 
     # Check each row for a long horizontal run of changed pixels
+    # Use strict threshold — on gradient backgrounds, the inpainting diff
+    # in the bottom region can falsely trigger underline detection
+    strong_threshold = np.percentile(diff.flatten(), 80)
     for row in bottom_region:
-        run = np.sum(row >= threshold)
-        if run > box_w * 0.6:
+        run = np.sum(row >= strong_threshold)
+        if run > box_w * 0.75:
             return True
 
     return False
+
+
+def detect_font_styles_docai(image_bytes: bytes) -> dict | None:
+    """Call Google Document AI to get font style metadata.
+
+    Returns dict with 'full_text' and 'styles' list, or None if not configured.
+    The 'styles' list uses the same format as the old Azure DI path so that
+    match_region_style() works without changes.
+    """
+    client = get_docai_client()
+    if not client:
+        return None
+
+    try:
+        from google.cloud import documentai_v1 as documentai
+
+        raw_document = documentai.RawDocument(
+            content=image_bytes,
+            mime_type="image/png",
+        )
+        request = documentai.ProcessRequest(
+            name=_docai_processor,
+            raw_document=raw_document,
+            process_options=documentai.ProcessOptions(
+                ocr_config=documentai.OcrConfig(
+                    premium_features=documentai.OcrConfig.PremiumFeatures(
+                        compute_style_info=True,
+                    ),
+                ),
+            ),
+        )
+        result = client.process_document(request=request)
+        document = result.document
+        full_text = document.text or ""
+
+        # Build style entries from token-level style_info
+        styles = []
+        for page in document.pages:
+            for token in page.tokens:
+                si = token.style_info
+                if not si:
+                    continue
+                # Get token text from text_anchor
+                token_text = ""
+                offset = 0
+                length = 0
+                if token.layout and token.layout.text_anchor and token.layout.text_anchor.text_segments:
+                    seg = token.layout.text_anchor.text_segments[0]
+                    offset = seg.start_index
+                    length = seg.end_index - seg.start_index
+                    token_text = full_text[offset:seg.end_index]
+
+                style_entry = {
+                    "offset": offset,
+                    "length": length,
+                    "text": token_text,
+                }
+                # Bold — direct bool or weight >= 700
+                if si.bold:
+                    style_entry["fontWeight"] = "bold"
+                elif si.font_weight and si.font_weight >= 700:
+                    style_entry["fontWeight"] = "bold"
+                else:
+                    style_entry["fontWeight"] = "normal"
+                # Italic
+                if si.italic:
+                    style_entry["fontStyle"] = "italic"
+                # Font size — use pixel_font_size directly (already in pixels)
+                if si.pixel_font_size and si.pixel_font_size > 0:
+                    style_entry["fontSize"] = si.pixel_font_size
+                elif si.font_size and si.font_size > 0:
+                    style_entry["fontSize"] = si.font_size * 1.333  # pt to px
+                # Underline
+                if getattr(si, "underlined", False):
+                    style_entry["textDecoration"] = "underline"
+                # Font family from font_type (SANS_SERIF, SERIF, etc.)
+                ft = getattr(si, "font_type", "") or ""
+                if "SERIF" in ft and "SANS" not in ft:
+                    style_entry["fontFamily"] = "serif"
+                elif ft:
+                    style_entry["fontFamily"] = "sans-serif"
+                # Color — from style_info.text_color (0.0–1.0 floats)
+                if si.text_color:
+                    r = int((si.text_color.red or 0) * 255)
+                    g = int((si.text_color.green or 0) * 255)
+                    b = int((si.text_color.blue or 0) * 255)
+                    style_entry["color"] = f"#{r:02x}{g:02x}{b:02x}"
+
+                styles.append(style_entry)
+
+        print(f"[DocAI] Detected {len(styles)} style tokens in {len(full_text)} chars")
+        for st in styles:
+            print(f"  → '{st.get('text', '')[:30]}' weight={st.get('fontWeight')} color={st.get('color')} size={st.get('fontSize')}")
+
+        return {"full_text": full_text, "styles": styles}
+
+    except Exception as e:
+        print(f"[DocAI] Error: {e}")
+        return None
+
+
+def match_region_style(region_text: str, docai_data: dict | None) -> dict | None:
+    """Match an OCR region's text to Document AI style data.
+
+    Returns style dict or None if no match found.
+    """
+    if not docai_data or not docai_data.get("styles"):
+        return None
+
+    full_text = docai_data["full_text"]
+    styles = docai_data["styles"]
+
+    # Try to find the region text in Azure's full text (fuzzy: ignore whitespace differences)
+    region_clean = region_text.strip().replace("  ", " ")
+
+    # Collect all styles that overlap with this region's text
+    matching_styles = []
+
+    # Try exact substring match first
+    idx = full_text.find(region_clean)
+    if idx == -1:
+        # Try matching first few words
+        words = region_clean.split()
+        if len(words) >= 2:
+            prefix = " ".join(words[:3])
+            idx = full_text.find(prefix)
+
+    if idx == -1:
+        return None
+
+    region_start = idx
+    region_end = idx + len(region_clean)
+
+    for s in styles:
+        s_start = s["offset"]
+        s_end = s_start + s["length"]
+        # Check overlap
+        if s_start < region_end and s_end > region_start:
+            matching_styles.append(s)
+
+    if not matching_styles:
+        return None
+
+    # Weighted voting across all overlapping tokens — each token's vote
+    # is weighted by its character length so majority style wins
+    total_chars = sum(s["length"] for s in matching_styles)
+    if total_chars == 0:
+        return None
+
+    bold_chars = sum(s["length"] for s in matching_styles if s.get("fontWeight", "").lower() == "bold")
+    italic_chars = sum(s["length"] for s in matching_styles if s.get("fontStyle", "").lower() == "italic")
+    underline_chars = sum(s["length"] for s in matching_styles if "underline" in s.get("textDecoration", "").lower())
+
+    result = {}
+    result["is_bold"] = bold_chars > total_chars * 0.5
+    result["is_italic"] = italic_chars > total_chars * 0.5
+    result["is_underline"] = underline_chars > total_chars * 0.5
+
+    # Font family — majority vote
+    family_counts = {}
+    for s in matching_styles:
+        ff = s.get("fontFamily") or s.get("similarFontFamily") or "sans-serif"
+        family_counts[ff] = family_counts.get(ff, 0) + s["length"]
+    result["font_family"] = max(family_counts, key=family_counts.get)
+
+    # Font size — weighted average across tokens
+    size_sum = 0
+    size_weight = 0
+    for s in matching_styles:
+        fs = s.get("fontSize")
+        if fs and fs > 0:
+            size_sum += float(fs) * s["length"]
+            size_weight += s["length"]
+    if size_weight > 0:
+        result["font_size"] = round(size_sum / size_weight)
+
+    # Color — use the most common color (by character coverage)
+    color_counts = {}
+    for s in matching_styles:
+        c = s.get("color")
+        if c and c.startswith("#") and len(c) == 7:
+            color_counts[c] = color_counts.get(c, 0) + s["length"]
+    if color_counts:
+        best_color = max(color_counts, key=color_counts.get)
+        r = int(best_color[1:3], 16)
+        g = int(best_color[3:5], 16)
+        b = int(best_color[5:7], 16)
+        result["color"] = (r, g, b)
+
+    print(f"[DocAI] Matched '{region_text[:40]}' → bold={result.get('is_bold')} italic={result.get('is_italic')} family={result.get('font_family')} size={result.get('font_size')} (bold_ratio={bold_chars}/{total_chars})")
+    return result
+
+
+def match_region_style_spans(region_text: str, docai_data: dict | None) -> list[dict] | None:
+    """Return proportional style spans for a region's text.
+
+    Each span covers a [start, end) range normalized to 0.0–1.0 of the region
+    text length, with per-span fontWeight, fontStyle, color, fontFamily.
+    Returns None if no match found.
+    """
+    if not docai_data or not docai_data.get("styles"):
+        return None
+
+    full_text = docai_data["full_text"]
+    styles = docai_data["styles"]
+
+    region_clean = region_text.strip().replace("  ", " ")
+    idx = full_text.find(region_clean)
+    if idx == -1:
+        words = region_clean.split()
+        if len(words) >= 2:
+            prefix = " ".join(words[:3])
+            idx = full_text.find(prefix)
+    if idx == -1:
+        return None
+
+    region_start = idx
+    region_end = idx + len(region_clean)
+    region_len = max(1, len(region_clean))
+
+    # Build per-character style array from overlapping tokens
+    # Default style for characters not covered by any token
+    default_style = {"fontWeight": "normal", "fontStyle": "normal",
+                     "color": None, "fontFamily": "sans-serif"}
+    char_styles = [dict(default_style) for _ in range(region_len)]
+
+    for s in styles:
+        s_start = s["offset"]
+        s_end = s_start + s["length"]
+        # Clamp to region bounds
+        ov_start = max(s_start, region_start) - region_start
+        ov_end = min(s_end, region_end) - region_start
+        if ov_start >= ov_end:
+            continue
+        for ci in range(ov_start, ov_end):
+            cs = char_styles[ci]
+            if s.get("fontWeight"):
+                cs["fontWeight"] = s["fontWeight"]
+            if s.get("fontStyle"):
+                cs["fontStyle"] = s["fontStyle"]
+            if s.get("color"):
+                cs["color"] = s["color"]
+            if s.get("fontFamily"):
+                cs["fontFamily"] = s["fontFamily"]
+
+    # Merge consecutive characters with identical style into spans
+    spans = []
+    i = 0
+    while i < region_len:
+        cur = char_styles[i]
+        j = i + 1
+        while j < region_len and char_styles[j] == cur:
+            j += 1
+        spans.append({
+            "start": i / region_len,
+            "end": j / region_len,
+            "fontWeight": cur["fontWeight"],
+            "fontStyle": cur["fontStyle"],
+            "color": cur["color"],
+            "fontFamily": cur["fontFamily"],
+        })
+        i = j
+
+    return spans
+
+
+def map_styles_to_words(translated_text: str, style_spans: list[dict]) -> list[dict]:
+    """Map proportional style spans to individual words of translated text.
+
+    Returns list of {"word": str, "style": dict} entries.
+    Each word gets the style of the span covering its midpoint.
+    """
+    words = translated_text.split()
+    if not words or not style_spans:
+        return [{"word": w, "style": style_spans[0] if style_spans else {}} for w in words]
+
+    total_len = len(translated_text)
+    if total_len == 0:
+        return [{"word": w, "style": style_spans[0]} for w in words]
+
+    result = []
+    pos = 0
+    for word in words:
+        word_start = translated_text.find(word, pos)
+        if word_start == -1:
+            word_start = pos
+        word_mid = (word_start + word_start + len(word)) / 2.0
+        prop = word_mid / total_len
+
+        # Find the span covering this proportional position
+        matched_style = style_spans[-1]  # default to last span
+        for span in style_spans:
+            if span["start"] <= prop < span["end"]:
+                matched_style = span
+                break
+
+        result.append({"word": word, "style": matched_style})
+        pos = word_start + len(word)
+
+    return result
 
 
 def analyze_text_style(
     original: Image.Image,
     inpainted: Image.Image,
     vertices: list[tuple[int, int]],
+    docai_styles: dict | None = None,
+    region_text: str = "",
 ) -> dict:
-    """Comprehensive text style analysis: color, bold, italic, underline, font family."""
-    color, is_bold = sample_text_color(original, inpainted, vertices)
-    is_italic = detect_italic(original, inpainted, vertices)
-    is_underline = detect_underline(original, inpainted, vertices)
-    font_family = detect_font_family(original, vertices)
+    """Comprehensive text style analysis.
+
+    If docai_styles is provided, uses Document AI data for bold/italic/fontFamily.
+    Falls back to pixel-based detection otherwise.
+    Always uses pixel-based color detection (more reliable for the actual rendered color).
+    """
+    # Always get color from pixel analysis (Document AI color may not match rendered color)
+    color, pixel_bold = sample_text_color(original, inpainted, vertices)
+
+    # Try Document AI first
+    docai_match = match_region_style(region_text, docai_styles) if docai_styles and region_text else None
+
+    if docai_match:
+        is_bold = docai_match.get("is_bold", pixel_bold)
+        is_italic = docai_match.get("is_italic", False)
+        is_underline = docai_match.get("is_underline", False)
+        font_family = docai_match.get("font_family", "sans-serif")
+        # Use Document AI color if pixel detection returned a fallback
+        if "color" in docai_match:
+            color = docai_match["color"]
+    else:
+        # Fallback to pixel-based detection
+        is_bold = pixel_bold
+        is_italic = detect_italic(original, inpainted, vertices)
+        is_underline = detect_underline(original, inpainted, vertices)
+        font_family = detect_font_family(original, vertices)
 
     return {
         "color": color,
@@ -520,6 +881,7 @@ def analyze_text_style(
         "is_italic": is_italic,
         "is_underline": is_underline,
         "font_family": font_family,
+        "_docai_font_size": docai_match.get("font_size") if docai_match else None,  # informational only
     }
 
 
@@ -554,6 +916,15 @@ def get_font(
     font_family: str = "sans-serif",
 ) -> ImageFont.FreeTypeFont:
     """Pick the right Noto font for the target language and style."""
+    # Non-Latin scripts: NotoSerif doesn't have Devanagari/etc glyphs,
+    # so force sans-serif for any language that isn't Latin-script based
+    LATIN_LANGS = {"en", "es", "fr", "de", "it", "pt", "nl", "pl", "ro", "cs",
+                   "sk", "hr", "sv", "da", "no", "fi", "hu", "tr", "vi", "id",
+                   "ms", "tl", "sw", "af", "ca", "eu", "gl", "lt", "lv", "et",
+                   "sl", "mt", "sq", "cy", "ga", "is"}
+    if target_lang not in LATIN_LANGS and font_family != "sans-serif":
+        font_family = "sans-serif"
+
     if target_lang in CJK_LANGS:
         candidates = ["NotoSansCJKsc-Regular.otf", "NotoSansCJK-Regular.ttc"]
     elif target_lang in ARABIC_LANGS:
@@ -660,6 +1031,170 @@ def _wrap_text_cjk(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> l
     return lines if lines else [text]
 
 
+def _wrap_text_styled(
+    word_styles: list[dict],
+    target_lang: str,
+    max_width: int,
+    base_font_size: int,
+) -> list[list[dict]]:
+    """Wrap styled words into lines that fit max_width.
+
+    Each word gets its own font based on its style. Returns list of lines,
+    where each line is a list of {"word", "font", "color", "width", "underline"}.
+    """
+    if not word_styles:
+        return []
+
+    # Check if word styles have significantly different colors (not just noise)
+    def _parse_hex(h):
+        if not h or not h.startswith("#") or len(h) != 7:
+            return None
+        return (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
+
+    span_colors = [_parse_hex(ws["style"].get("color")) for ws in word_styles]
+    span_colors = [c for c in span_colors if c]
+    has_distinct_colors = False
+    if len(span_colors) >= 2:
+        for i in range(len(span_colors)):
+            if has_distinct_colors:
+                break
+            for j in range(i + 1, len(span_colors)):
+                dist = (abs(span_colors[i][0] - span_colors[j][0])
+                        + abs(span_colors[i][1] - span_colors[j][1])
+                        + abs(span_colors[i][2] - span_colors[j][2]))
+                if dist > 150:
+                    has_distinct_colors = True
+                    break
+
+    # Build font and measure width for each word
+    entries = []
+    for ws in word_styles:
+        st = ws["style"]
+        is_bold = st.get("fontWeight", "normal").lower() == "bold"
+        is_italic = st.get("fontStyle", "normal").lower() == "italic"
+        ff = st.get("fontFamily", "sans-serif") or "sans-serif"
+        font = get_font(target_lang, base_font_size, bold=is_bold, italic=is_italic, font_family=ff)
+        bbox = font.getbbox(ws["word"])
+        w = bbox[2] - bbox[0]
+        # Only use per-word color when spans have truly distinct colors
+        color_hex = st.get("color") if has_distinct_colors else None
+        underline = "underline" in st.get("textDecoration", "").lower() if st.get("textDecoration") else False
+        entries.append({
+            "word": ws["word"],
+            "font": font,
+            "color_hex": color_hex,
+            "width": w,
+            "bold": is_bold,
+            "underline": underline,
+        })
+
+    # Greedy line wrapping (respects explicit \n in words)
+    lines = []
+    current_line = []
+    current_w = 0
+    space_w = entries[0]["font"].getbbox(" ")[2] - entries[0]["font"].getbbox(" ")[0] if entries else 4
+
+    for entry in entries:
+        # Handle explicit newlines within a word (e.g. user-edited text)
+        if "\n" in entry["word"]:
+            parts = entry["word"].split("\n")
+            for pi, part in enumerate(parts):
+                if part:
+                    part_entry = dict(entry)
+                    part_entry["word"] = part
+                    bbox = part_entry["font"].getbbox(part)
+                    part_entry["width"] = bbox[2] - bbox[0]
+                    test_w = current_w + (space_w if current_line else 0) + part_entry["width"]
+                    if test_w <= max_width or not current_line:
+                        current_line.append(part_entry)
+                        current_w = test_w
+                    else:
+                        lines.append(current_line)
+                        current_line = [part_entry]
+                        current_w = part_entry["width"]
+                if pi < len(parts) - 1:
+                    # Force line break
+                    if current_line:
+                        lines.append(current_line)
+                    current_line = []
+                    current_w = 0
+            continue
+
+        test_w = current_w + (space_w if current_line else 0) + entry["width"]
+        if test_w <= max_width or not current_line:
+            current_line.append(entry)
+            current_w = test_w
+        else:
+            lines.append(current_line)
+            current_line = [entry]
+            current_w = entry["width"]
+    if current_line:
+        lines.append(current_line)
+
+    return lines
+
+
+def _render_styled_lines(
+    draw: ImageDraw.Draw,
+    lines: list[list[dict]],
+    x: int, y: int,
+    box_w: int, box_h: int,
+    alignment: str,
+    default_color: tuple,
+    alpha: int = 255,
+    base_font_size: int = 16,
+):
+    """Draw word-by-word with per-word font and color."""
+    if not lines:
+        return
+
+    # Compute line heights
+    line_heights = []
+    for line in lines:
+        max_lh = max(_line_height(e["font"]) for e in line) if line else 0
+        line_heights.append(max_lh)
+    total_h = sum(line_heights)
+
+    cy = y + max(0, (box_h - total_h) // 2)
+
+    for line, lh in zip(lines, line_heights):
+        # Compute line width
+        space_w = line[0]["font"].getbbox(" ")[2] - line[0]["font"].getbbox(" ")[0] if line else 4
+        line_w = sum(e["width"] for e in line) + space_w * max(0, len(line) - 1)
+
+        if alignment == "left":
+            cx = x
+        elif alignment == "right":
+            cx = x + box_w - line_w
+        else:
+            cx = x + max(0, (box_w - line_w) // 2)
+
+        for i, entry in enumerate(line):
+            # Resolve color
+            c_hex = entry.get("color_hex")
+            if c_hex and c_hex.startswith("#") and len(c_hex) == 7:
+                cr = int(c_hex[1:3], 16)
+                cg = int(c_hex[3:5], 16)
+                cb = int(c_hex[5:7], 16)
+                fill = (cr, cg, cb, alpha)
+            else:
+                fill = (*default_color, alpha)
+
+            draw.text((cx, cy), entry["word"], fill=fill, font=entry["font"])
+
+            if entry.get("underline"):
+                ul_y = cy + lh - 2
+                ul_thick = max(1, base_font_size // 14)
+                draw.line([(cx, ul_y), (cx + entry["width"], ul_y)],
+                          fill=fill, width=ul_thick)
+
+            cx += entry["width"]
+            if i < len(line) - 1:
+                cx += space_w
+
+        cy += lh
+
+
 def _line_height(font: ImageFont.FreeTypeFont) -> int:
     """Compute line height from font metrics."""
     bbox = font.getbbox("Ayg|")
@@ -685,14 +1220,14 @@ def _estimate_original_font_size(orig_text: str, box_h: int, word_height: int = 
     return max(6, estimated)
 
 
-def _normalize_font_sizes(layers: list[dict], proximity: int = 200, size_tolerance: float = 0.3):
+def _normalize_font_sizes(layers: list[dict], proximity: int = 120, size_tolerance: float = 0.30):
     """Group spatially close regions with similar original font sizes and normalize.
 
     Regions are grouped if:
     - Their bounding boxes are within `proximity` pixels of each other
     - Their originalFontSize values are within `size_tolerance` ratio of each other
 
-    All regions in a group get the minimum fontSize in the group,
+    All regions in a group get the median fontSize in the group,
     ensuring consistent sizing for text from the same visual section.
     """
     if not layers:
@@ -729,7 +1264,8 @@ def _normalize_font_sizes(layers: list[dict], proximity: int = 200, size_toleran
                         queue.append(j)
 
         if len(group) > 1:
-            min_size = min(layers[idx]["fontSize"] for idx in group)
+            sorted_sizes = sorted(layers[idx]["fontSize"] for idx in group)
+            min_size = sorted_sizes[len(sorted_sizes) // 2]  # median
             orig_sizes = [layers[idx].get("originalFontSize", 0) for idx in group]
             # Use majority vote for bold/italic/underline
             bold_votes = sum(1 for idx in group if layers[idx].get("bold"))
@@ -921,78 +1457,114 @@ def render_layers_on_image(
             r, g, b = 0, 0, 0
         alpha = int(opacity * 255)
 
-        font = get_font(target_lang, font_size, bold=is_bold, italic=is_italic, font_family=font_family)
-        # If text contains newlines, it was pre-wrapped by the editor — use as-is
-        if "\n" in text:
-            lines = text.split("\n")
-        else:
-            lines = _wrap_text(text, font, w)
-        lh = _line_height(font)
-        total_h = len(lines) * lh
-        # Actual max line width (may exceed bounding box w with server fonts)
-        max_lw = max((font.getbbox(ln)[2] - font.getbbox(ln)[0]) for ln in lines) if lines else w
-        actual_w = max(w, max_lw)
-        actual_h = max(h, total_h)
+        # Check for per-word style spans (proportional mapping from Document AI)
+        style_spans = layer.get("styleSpans")
 
-        if abs(angle) < 1:
-            # No rotation — draw directly on full overlay (fast path)
-            overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
-            overlay_draw = ImageDraw.Draw(overlay)
-            cy = y + max(0, (h - total_h) // 2)
-            for line in lines:
-                line_bbox = font.getbbox(line)
-                line_w = line_bbox[2] - line_bbox[0]
-                if alignment == "left":
-                    cx = x
-                elif alignment == "right":
-                    cx = x + w - line_w
-                else:
-                    cx = x + max(0, (w - line_w) // 2)
-                overlay_draw.text((cx, cy), line, fill=(r, g, b, alpha), font=font)
-                if underline:
-                    ul_y = cy + lh - 2
-                    ul_thick = max(1, font_size // 14)
-                    overlay_draw.line(
-                        [(cx, ul_y), (cx + line_w, ul_y)],
-                        fill=(r, g, b, alpha), width=ul_thick,
-                    )
-                cy += lh
-            result = Image.alpha_composite(result, overlay)
+        font = get_font(target_lang, font_size, bold=is_bold, italic=is_italic, font_family=font_family)
+
+        if style_spans:
+            # ── Word-by-word styled rendering ──
+            word_styles = map_styles_to_words(text, style_spans)
+            styled_lines = _wrap_text_styled(word_styles, target_lang, w, font_size)
+
+            if abs(angle) < 1:
+                overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
+                overlay_draw = ImageDraw.Draw(overlay)
+                _render_styled_lines(overlay_draw, styled_lines, x, y, w, h,
+                                     alignment, (r, g, b), alpha, font_size)
+                result = Image.alpha_composite(result, overlay)
+            else:
+                # Compute actual dimensions for rotated styled text
+                line_heights = [max(_line_height(e["font"]) for e in ln) for ln in styled_lines]
+                total_h = sum(line_heights)
+                space_w = 4
+                max_lw = max(
+                    sum(e["width"] for e in ln) + space_w * max(0, len(ln) - 1)
+                    for ln in styled_lines
+                ) if styled_lines else w
+                actual_w = max(w, max_lw)
+                actual_h = max(h, total_h)
+                pad = 8
+                canvas_w = actual_w + pad * 2
+                canvas_h = actual_h + pad * 2
+                txt_img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+                txt_draw = ImageDraw.Draw(txt_img)
+                _render_styled_lines(txt_draw, styled_lines, pad, pad, actual_w, actual_h,
+                                     alignment, (r, g, b), alpha, font_size)
+                rotated = txt_img.rotate(-angle, resample=Image.BICUBIC, expand=True)
+                rw, rh = rotated.size
+                paste_x = x + w // 2 - rw // 2
+                paste_y = y + h // 2 - rh // 2
+                overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
+                overlay.paste(rotated, (paste_x, paste_y))
+                result = Image.alpha_composite(result, overlay)
         else:
-            # Rotated text — render upright on a sized canvas, rotate, paste
-            pad = 8
-            canvas_w = actual_w + pad * 2
-            canvas_h = actual_h + pad * 2
-            txt_img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-            txt_draw = ImageDraw.Draw(txt_img)
-            cy = pad + max(0, (actual_h - total_h) // 2)
-            for line in lines:
-                line_bbox = font.getbbox(line)
-                line_w = line_bbox[2] - line_bbox[0]
-                if alignment == "left":
-                    cx = pad
-                elif alignment == "right":
-                    cx = pad + actual_w - line_w
-                else:
-                    cx = pad + max(0, (actual_w - line_w) // 2)
-                txt_draw.text((cx, cy), line, fill=(r, g, b, alpha), font=font)
-                if underline:
-                    ul_y = cy + lh - 2
-                    ul_thick = max(1, font_size // 14)
-                    txt_draw.line(
-                        [(cx, ul_y), (cx + line_w, ul_y)],
-                        fill=(r, g, b, alpha), width=ul_thick,
-                    )
-                cy += lh
-            # Rotate around center (negative because Pillow rotates CCW)
-            rotated = txt_img.rotate(-angle, resample=Image.BICUBIC, expand=True)
-            # Paste centered at the bounding box center
-            rw, rh = rotated.size
-            paste_x = x + w // 2 - rw // 2
-            paste_y = y + h // 2 - rh // 2
-            overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
-            overlay.paste(rotated, (paste_x, paste_y))
-            result = Image.alpha_composite(result, overlay)
+            # ── Uniform style rendering (fallback) ──
+            if "\n" in text:
+                lines = text.split("\n")
+            else:
+                lines = _wrap_text(text, font, w)
+            lh = _line_height(font)
+            total_h = len(lines) * lh
+            max_lw = max((font.getbbox(ln)[2] - font.getbbox(ln)[0]) for ln in lines) if lines else w
+            actual_w = max(w, max_lw)
+            actual_h = max(h, total_h)
+
+            if abs(angle) < 1:
+                overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
+                overlay_draw = ImageDraw.Draw(overlay)
+                cy = y + max(0, (h - total_h) // 2)
+                for line in lines:
+                    line_bbox = font.getbbox(line)
+                    line_w = line_bbox[2] - line_bbox[0]
+                    if alignment == "left":
+                        cx = x
+                    elif alignment == "right":
+                        cx = x + w - line_w
+                    else:
+                        cx = x + max(0, (w - line_w) // 2)
+                    overlay_draw.text((cx, cy), line, fill=(r, g, b, alpha), font=font)
+                    if underline:
+                        ul_y = cy + lh - 2
+                        ul_thick = max(1, font_size // 14)
+                        overlay_draw.line(
+                            [(cx, ul_y), (cx + line_w, ul_y)],
+                            fill=(r, g, b, alpha), width=ul_thick,
+                        )
+                    cy += lh
+                result = Image.alpha_composite(result, overlay)
+            else:
+                pad = 8
+                canvas_w = actual_w + pad * 2
+                canvas_h = actual_h + pad * 2
+                txt_img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+                txt_draw = ImageDraw.Draw(txt_img)
+                cy = pad + max(0, (actual_h - total_h) // 2)
+                for line in lines:
+                    line_bbox = font.getbbox(line)
+                    line_w = line_bbox[2] - line_bbox[0]
+                    if alignment == "left":
+                        cx = pad
+                    elif alignment == "right":
+                        cx = pad + actual_w - line_w
+                    else:
+                        cx = pad + max(0, (actual_w - line_w) // 2)
+                    txt_draw.text((cx, cy), line, fill=(r, g, b, alpha), font=font)
+                    if underline:
+                        ul_y = cy + lh - 2
+                        ul_thick = max(1, font_size // 14)
+                        txt_draw.line(
+                            [(cx, ul_y), (cx + line_w, ul_y)],
+                            fill=(r, g, b, alpha), width=ul_thick,
+                        )
+                    cy += lh
+                rotated = txt_img.rotate(-angle, resample=Image.BICUBIC, expand=True)
+                rw, rh = rotated.size
+                paste_x = x + w // 2 - rw // 2
+                paste_y = y + h // 2 - rh // 2
+                overlay = Image.new("RGBA", result.size, (0, 0, 0, 0))
+                overlay.paste(rotated, (paste_x, paste_y))
+                result = Image.alpha_composite(result, overlay)
 
     return result.convert("RGB")
 
@@ -1122,8 +1694,22 @@ async def phase1_clean(request: Request):
             verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
         mask_regions.append({"vertices": verts})
 
-    # Inpaint regions — pass mask_mode to control masking strategy
-    inpainted = inpaint_sequential(original, mask_regions, mask_mode=mask_mode)
+    # Call Google Document AI for font style detection (if configured)
+    # Run in thread pool to avoid blocking the async event loop
+    async def _docai_task():
+        try:
+            img_buf = io.BytesIO()
+            original.save(img_buf, format="PNG")
+            return await asyncio.to_thread(detect_font_styles_docai, img_buf.getvalue())
+        except Exception as e:
+            print(f"[DocAI] Skipping: {e}")
+            return None
+
+    async def _inpaint_task():
+        return await asyncio.to_thread(inpaint_sequential, original, mask_regions, mask_mode)
+
+    # Run Document AI and inpainting concurrently
+    docai_styles, inpainted = await asyncio.gather(_docai_task(), _inpaint_task())
 
     # Build layer metadata
     layer_data = []
@@ -1166,7 +1752,8 @@ async def phase1_clean(request: Request):
         # position, color sampling, font sizing
         # The angle handles the visual rotation in the editor
         sample_verts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-        style = analyze_text_style(original, inpainted, sample_verts)
+        style = analyze_text_style(original, inpainted, sample_verts,
+                                   docai_styles=docai_styles, region_text=orig_text)
         color = style["color"]
         is_bold = bool(style["is_bold"])
         is_italic = bool(style["is_italic"])
@@ -1202,11 +1789,20 @@ async def phase1_clean(request: Request):
             fit_w, fit_h = h, w
         else:
             fit_w, fit_h = w, h
+        # Estimate original font size from bounding box dimensions
+        # (Document AI pixel_font_size is typographic, not rendered size — don't use as cap)
         word_h = r.get("word_height", 0)
         orig_font_size = _estimate_original_font_size(orig_text, fit_h, word_h)
         font_size = _fit_font_size(trans_text, target_lang, fit_w, fit_h,
                                    bold=is_bold, max_size=orig_font_size)
         hex_color = "#{:02x}{:02x}{:02x}".format(*color)
+
+        # Get per-word style spans for proportional mapping
+        style_spans = match_region_style_spans(orig_text, docai_styles)
+        if style_spans:
+            print(f"[StyleSpans] '{orig_text[:40]}' → {len(style_spans)} spans:")
+            for sp in style_spans:
+                print(f"  [{sp['start']:.2f}-{sp['end']:.2f}] weight={sp.get('fontWeight')} color={sp.get('color')} family={sp.get('fontFamily')}")
 
         layer_data.append({
             "originalText": orig_text,
@@ -1224,6 +1820,7 @@ async def phase1_clean(request: Request):
             "fontFamily": font_family,
             "alignment": alignment,
             "angle": angle,
+            "styleSpans": style_spans,
         })
 
     # ── Post-process: normalize font sizes for spatially grouped regions ──
