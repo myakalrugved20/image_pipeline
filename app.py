@@ -28,7 +28,10 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from google.cloud import vision
+from google.cloud import translate_v3 as translate_v3
 from deep_translator import GoogleTranslator
+import html as html_module
+import re
 from simple_lama_inpainting import SimpleLama
 from sklearn.cluster import KMeans
 
@@ -210,6 +213,232 @@ def translate_texts(texts: list[str], source: str, target: str) -> list[str]:
         return results
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Translation error: {exc}")
+
+
+# ── GCP project for Cloud Translation v3 ──────────────────────────────────
+_GCP_PROJECT_ID = None
+_docai_proc = os.environ.get("GOOGLE_DOCAI_PROCESSOR", "")
+if _docai_proc:
+    # Extract project ID from "projects/PROJECT_ID/locations/..."
+    parts = _docai_proc.strip('"').split("/")
+    if len(parts) >= 2 and parts[0] == "projects":
+        _GCP_PROJECT_ID = parts[1]
+
+
+def _build_styled_html(orig_text: str, style_spans: list[dict]) -> str:
+    """Wrap original text with HTML tags based on per-character style spans.
+
+    style_spans are proportional [start, end) ranges over the text.
+    Returns HTML string with <b>, <i> tags around styled segments.
+    """
+    if not style_spans:
+        return html_module.escape(orig_text)
+
+    text_len = len(orig_text)
+    if text_len == 0:
+        return ""
+
+    # Build per-character bold/italic array
+    char_bold = [False] * text_len
+    char_italic = [False] * text_len
+    for span in style_spans:
+        s = int(span["start"] * text_len)
+        e = min(int(span["end"] * text_len), text_len)
+        is_bold = span.get("fontWeight", "normal").lower() == "bold"
+        is_italic = span.get("fontStyle", "normal").lower() == "italic"
+        for ci in range(s, e):
+            if is_bold:
+                char_bold[ci] = True
+            if is_italic:
+                char_italic[ci] = True
+
+    # Build HTML by grouping consecutive chars with same bold/italic state
+    result = []
+    i = 0
+    while i < text_len:
+        b = char_bold[i]
+        it = char_italic[i]
+        j = i + 1
+        while j < text_len and char_bold[j] == b and char_italic[j] == it:
+            j += 1
+        segment = html_module.escape(orig_text[i:j])
+        if b and it:
+            segment = f"<b><i>{segment}</i></b>"
+        elif b:
+            segment = f"<b>{segment}</b>"
+        elif it:
+            segment = f"<i>{segment}</i>"
+        result.append(segment)
+        i = j
+
+    return "".join(result)
+
+
+def _parse_styled_translation(html_text: str) -> list[dict]:
+    """Parse translated HTML into word-level style entries.
+
+    Returns list of {"word": str, "style": {"fontWeight": ..., "fontStyle": ...}}.
+    """
+    # Parse HTML tags to determine bold/italic per character
+    # Remove any wrapping tags Google might add
+    text = html_text.strip()
+
+    # Track bold/italic state while walking through the HTML
+    words_with_styles = []
+    current_word = []
+    current_bold = False
+    current_italic = False
+    tag_stack_bold = 0
+    tag_stack_italic = 0
+
+    i = 0
+    while i < len(text):
+        if text[i] == '<':
+            # Find end of tag
+            end = text.find('>', i)
+            if end == -1:
+                current_word.append(text[i])
+                i += 1
+                continue
+            tag = text[i+1:end].strip().lower()
+            if tag == 'b' or tag == 'strong':
+                tag_stack_bold += 1
+                current_bold = True
+            elif tag == '/b' or tag == '/strong':
+                tag_stack_bold = max(0, tag_stack_bold - 1)
+                current_bold = tag_stack_bold > 0
+            elif tag == 'i' or tag == 'em':
+                tag_stack_italic += 1
+                current_italic = True
+            elif tag == '/i' or tag == '/em':
+                tag_stack_italic = max(0, tag_stack_italic - 1)
+                current_italic = tag_stack_italic > 0
+            # Skip other tags (span, etc.)
+            i = end + 1
+            continue
+
+        if text[i] == '&':
+            # HTML entity
+            end = text.find(';', i)
+            if end != -1:
+                entity = text[i:end+1]
+                decoded = html_module.unescape(entity)
+                if decoded == ' ':
+                    # Space — flush current word
+                    if current_word:
+                        word_str = "".join(c for c, _, _ in current_word)
+                        # Use majority vote for bold/italic in the word
+                        bold_count = sum(1 for _, b, _ in current_word if b)
+                        italic_count = sum(1 for _, _, it in current_word if it)
+                        words_with_styles.append({
+                            "word": word_str,
+                            "style": {
+                                "fontWeight": "bold" if bold_count > len(current_word) / 2 else "normal",
+                                "fontStyle": "italic" if italic_count > len(current_word) / 2 else "normal",
+                            }
+                        })
+                        current_word = []
+                else:
+                    for ch in decoded:
+                        current_word.append((ch, current_bold, current_italic))
+                i = end + 1
+                continue
+
+        ch = text[i]
+        if ch in (' ', '\n', '\t'):
+            # Flush current word
+            if current_word:
+                word_str = "".join(c for c, _, _ in current_word)
+                bold_count = sum(1 for _, b, _ in current_word if b)
+                italic_count = sum(1 for _, _, it in current_word if it)
+                words_with_styles.append({
+                    "word": word_str,
+                    "style": {
+                        "fontWeight": "bold" if bold_count > len(current_word) / 2 else "normal",
+                        "fontStyle": "italic" if italic_count > len(current_word) / 2 else "normal",
+                    }
+                })
+                current_word = []
+        else:
+            current_word.append((ch, current_bold, current_italic))
+        i += 1
+
+    # Flush last word
+    if current_word:
+        word_str = "".join(c for c, _, _ in current_word)
+        bold_count = sum(1 for _, b, _ in current_word if b)
+        italic_count = sum(1 for _, _, it in current_word if it)
+        words_with_styles.append({
+            "word": word_str,
+            "style": {
+                "fontWeight": "bold" if bold_count > len(current_word) / 2 else "normal",
+                "fontStyle": "italic" if italic_count > len(current_word) / 2 else "normal",
+            }
+        })
+
+    return words_with_styles
+
+
+def translate_text_styled(orig_text: str, style_spans: list[dict] | None,
+                          source: str, target: str) -> tuple[str, list[dict] | None]:
+    """Translate text preserving bold/italic via HTML markup.
+
+    Uses Google Cloud Translation v3 with mime_type="text/html".
+    Returns (translated_plain_text, word_styles) where word_styles is a list of
+    {"word": str, "style": {"fontWeight": ..., "fontStyle": ...}}.
+
+    Falls back to plain translation if no style spans or GCP project not configured.
+    """
+    if not style_spans or not _GCP_PROJECT_ID:
+        # No styles to preserve or no GCP project — plain translation
+        result = translate_texts([orig_text], source, target)
+        return result[0] if result else orig_text, None
+
+    # Check if there are any bold or italic spans
+    has_styled = any(
+        s.get("fontWeight", "normal").lower() == "bold" or
+        s.get("fontStyle", "normal").lower() == "italic"
+        for s in style_spans
+    )
+    if not has_styled:
+        result = translate_texts([orig_text], source, target)
+        return result[0] if result else orig_text, None
+
+    # Build HTML with style tags
+    styled_html = _build_styled_html(orig_text, style_spans)
+    print(f"[StyledTranslate] HTML input: {styled_html[:100]}")
+
+    try:
+        client = translate_v3.TranslationServiceClient()
+        parent = f"projects/{_GCP_PROJECT_ID}/locations/global"
+
+        response = client.translate_text(
+            request={
+                "parent": parent,
+                "contents": [styled_html],
+                "mime_type": "text/html",
+                "source_language_code": source if source != "auto" else "",
+                "target_language_code": target,
+            }
+        )
+
+        translated_html = response.translations[0].translated_text
+        print(f"[StyledTranslate] HTML output: {translated_html[:100]}")
+
+        # Parse HTML to get word-level styles
+        word_styles = _parse_styled_translation(translated_html)
+
+        # Build plain text from word styles
+        plain_text = " ".join(ws["word"] for ws in word_styles)
+
+        print(f"[StyledTranslate] Words: {[(ws['word'], ws['style']['fontWeight']) for ws in word_styles]}")
+
+        return plain_text, word_styles
+
+    except Exception as e:
+        print(f"[StyledTranslate] Error: {e}, falling back to plain translation")
+        result = translate_texts([orig_text], source, target)
+        return result[0] if result else orig_text, None
 
 
 # ── Mask creation (adaptive dilation) ─────────────────────────────────────
@@ -1246,26 +1475,29 @@ def _estimate_original_font_size(orig_text: str, box_h: int, word_height: int = 
     if docai_font_size and docai_font_size > 0:
         return max(6, int(docai_font_size))
     if word_height > 0:
-        # Word bbox height ≈ font size (slightly larger due to ascenders/descenders)
-        return max(6, int(word_height * 0.85))
+        # Word bbox height is the rendered pixel height of characters, which is
+        # smaller than font em-size (cap height ≈ 72% of em, ascender range ≈ 85-95%).
+        # Use 1.0 as a conservative estimate — still allows binary search room.
+        return max(6, int(word_height * 1.0))
     # Fallback: estimate from paragraph box height
     line_count = max(1, orig_text.count("\n") + 1)
     words = orig_text.split()
     if line_count == 1 and len(words) > 6:
         line_count = max(1, len(words) // 4)
-    estimated = int(box_h / line_count / 1.2)
+    estimated = int(box_h / line_count / 1.05)
     return max(6, estimated)
 
 
-def _normalize_font_sizes(layers: list[dict], target_lang: str = "", proximity: int = 120, size_tolerance: float = 0.30):
+def _normalize_font_sizes(layers: list[dict], target_lang: str = "", proximity: int = 200, size_tolerance: float = 0.40):
     """Group spatially close regions with similar original font sizes and normalize.
 
     Regions are grouped if:
     - Their bounding boxes are within `proximity` pixels of each other
     - Their originalFontSize values are within `size_tolerance` ratio of each other
 
-    All regions in a group get the median fontSize in the group,
-    ensuring consistent sizing for text from the same visual section.
+    All regions in a group get the max originalFontSize in the group,
+    applied directly as fontSize for consistency (DocAI tends to underestimate
+    for small/split regions).
     """
     if not layers:
         return
@@ -1309,9 +1541,8 @@ def _normalize_font_sizes(layers: list[dict], target_lang: str = "", proximity: 
 
         if len(group) > 1:
             orig_sizes = [layers[idx].get("originalFontSize", 0) for idx in group]
-            # Use median of originalFontSize as the target size for the group
-            sorted_orig = sorted(orig_sizes)
-            target_orig_size = sorted_orig[len(sorted_orig) // 2]
+            # Use max of originalFontSize — DocAI underestimates for small/split regions
+            target_orig_size = max(orig_sizes)
 
             # Use majority vote for bold/italic/underline
             bold_votes = sum(1 for idx in group if layers[idx].get("bold"))
@@ -1322,16 +1553,11 @@ def _normalize_font_sizes(layers: list[dict], target_lang: str = "", proximity: 
             group_italic = italic_votes > majority
             group_underline = underline_votes > majority
 
-            # Re-fit each layer's font size using the group's target original size as max
+            # Apply the group's target size directly for visual consistency
             print(f"[NORMALIZE] group of {len(group)}: origSizes={orig_sizes} → target={target_orig_size}px, bold={group_bold}, italic={group_italic}")
             for idx in group:
                 l = layers[idx]
-                fit_w = l.get("fitWidth", l["width"])
-                fit_h = l.get("fitHeight", l["height"])
-                text = l.get("translatedText", "")
-                new_size = _fit_font_size(text, target_lang, fit_w, fit_h,
-                                          bold=group_bold, max_size=target_orig_size)
-                l["fontSize"] = new_size
+                l["fontSize"] = target_orig_size
                 l["originalFontSize"] = target_orig_size
                 l["bold"] = group_bold
                 l["italic"] = group_italic
@@ -1512,14 +1738,22 @@ def render_layers_on_image(
             r, g, b = 0, 0, 0
         alpha = int(opacity * 255)
 
-        # Check for per-word style spans (proportional mapping from Document AI)
+        # Check for per-word styles (HTML translation) or style spans (proportional)
+        word_styles_direct = layer.get("wordStyles")
         style_spans = layer.get("styleSpans")
 
         font = get_font(target_lang, font_size, bold=is_bold, italic=is_italic, font_family=font_family)
 
-        if style_spans:
-            # ── Word-by-word styled rendering ──
+        if word_styles_direct:
+            # ── Word-level styles from HTML-based styled translation ──
+            word_styles = word_styles_direct
+        elif style_spans:
+            # ── Fallback: proportional mapping ──
             word_styles = map_styles_to_words(text, style_spans)
+        else:
+            word_styles = None
+
+        if word_styles:
             styled_lines = _wrap_text_styled(word_styles, target_lang, w, font_size)
 
             if abs(angle) < 1:
@@ -1850,20 +2084,36 @@ async def phase1_clean(request: Request):
         orig_font_size = _estimate_original_font_size(orig_text, fit_h, word_h,
                                                        docai_font_size=docai_fs)
         print(f"[FontSize] '{orig_text[:40]}' → origFS={orig_font_size} (docai={docai_fs}, wordH={word_h}, boxH={fit_h})")
-        font_size = _fit_font_size(trans_text, target_lang, fit_w, fit_h,
-                                   bold=is_bold, max_size=orig_font_size)
+        if docai_fs and docai_fs > 0:
+            # Use Document AI font size directly — preserves original sizing
+            font_size = max(6, int(docai_fs))
+            print(f"[FontSize] Using DocAI pixel_font_size directly: {font_size}px")
+        else:
+            font_size = _fit_font_size(trans_text, target_lang, fit_w, fit_h,
+                                       bold=is_bold, max_size=orig_font_size)
         hex_color = "#{:02x}{:02x}{:02x}".format(*color)
 
-        # Get per-word style spans for proportional mapping
+        # Get per-word style spans — use HTML-based styled translation for
+        # word-level bold/italic alignment, fall back to proportional mapping
         style_spans = match_region_style_spans(orig_text, docai_styles)
+        word_styles_from_html = None
         if style_spans:
             print(f"[StyleSpans] '{orig_text[:40]}' → {len(style_spans)} spans:")
             for sp in style_spans:
                 print(f"  [{sp['start']:.2f}-{sp['end']:.2f}] weight={sp.get('fontWeight')} color={sp.get('color')} family={sp.get('fontFamily')}")
 
+            # Re-translate with HTML markup for word-level style alignment
+            new_trans, word_styles_from_html = translate_text_styled(
+                orig_text, style_spans, "auto", target_lang
+            )
+            if word_styles_from_html:
+                trans_text = new_trans
+                print(f"[StyledTranslate] Re-translated '{orig_text[:40]}' → '{trans_text[:40]}'")
+
         layer_data.append({
             "originalText": orig_text,
             "translatedText": trans_text,
+            "wordStyles": word_styles_from_html,
             "x": x, "y": y,
             "width": w, "height": h,
             "fitWidth": fit_w,

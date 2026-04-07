@@ -6,7 +6,7 @@ Web app that translates text in images while preserving the original visual layo
 ## Tech Stack
 - **Backend**: FastAPI (Python), served with uvicorn on port 5000
 - **OCR**: Google Cloud Vision API (paragraph-level `full_text_annotation`)
-- **Translation**: deep-translator (GoogleTranslator)
+- **Translation**: Google Cloud Translation v3 (HTML-aware styled translation) + deep-translator (GoogleTranslator, fallback)
 - **Inpainting**: simple-lama-inpainting (LaMa model — loaded once at startup, heavy)
 - **Text rendering**: Pillow + Google Noto variable fonts (support bold via `set_variation_by_name`)
 - **Color detection**: scikit-learn KMeans clustering (text vs background pixel separation)
@@ -49,14 +49,15 @@ python app.py
 ## Key Implementation Details
 - **OCR filtering**: Skips regions with height < 14px, width < 14px, text < 2 chars, and small square regions with short text (icon detection)
 - **Adaptive mask dilation**: Per-region `dilation = max(3, box_h // 6)` using OpenCV elliptical kernel
-- **Bold detection**: Google Document AI `style_info.bold` / `font_weight ≥ 700` per token, with proportional mapping via `styleSpans` for per-word bold in mixed regions. Falls back to K-means text pixel stroke ratio > 0.35 when Document AI is unavailable.
-- **Per-word styling (styleSpans)**: Document AI returns per-token bold/italic/color/fontFamily. `match_region_style_spans()` builds proportional [0.0–1.0] spans, `map_styles_to_words()` maps them to translated text words. Both Fabric.js editor and server-side Pillow renderer apply per-word styles.
-- **Fabric.js per-character styles**: `styleSpans` are converted to Fabric.js `styles` object (keyed by unwrapped line index) for per-character bold/italic/color in the editor. Devanagari combining marks inherit the style of their preceding base character to avoid broken ligatures.
+- **Bold detection**: Google Document AI `style_info.bold` / `font_weight ≥ 700` per token. Falls back to K-means text pixel stroke ratio > 0.35 when Document AI is unavailable.
+- **HTML-based styled translation (wordStyles)**: `translate_text_styled()` wraps bold/italic source words in `<b>`/`<i>` HTML tags, translates via Cloud Translation v3 with `mime_type="text/html"`, and parses the output to get word-level style alignment. Google's NMT model repositions tags around the correct translated words — semantically accurate bold/italic mapping across languages. Falls back to proportional `styleSpans` mapping when Cloud Translation v3 is unavailable.
+- **Per-word styling (styleSpans, fallback)**: Document AI returns per-token bold/italic/color/fontFamily. `match_region_style_spans()` builds proportional [0.0–1.0] spans, `map_styles_to_words()` maps them to translated text words. Used as fallback when HTML-based styled translation is not available.
+- **Fabric.js per-character styles**: `wordStyles` (preferred) or `styleSpans` are converted to Fabric.js `styles` object (keyed by unwrapped line index) for per-character bold/italic/color in the editor. Devanagari combining marks inherit the style of their preceding base character to avoid broken ligatures.
 - **Color noise filtering**: Document AI per-token colors are noisy (affected by background/anti-aliasing). Per-word color is only applied when spans have truly distinct colors (RGB Manhattan distance > 150), otherwise the single K-means region color is used.
 - **Non-Latin font safety**: `get_font()` forces `sans-serif` for non-Latin-script languages (Hindi, Bengali, etc.) because `NotoSerif-Regular.ttf` lacks Devanagari glyphs — prevents tofu (□□□□) rendering.
 - **Alignment detection**: Heuristic based on bounding box x-position relative to image width
-- **Font sizing**: Binary search for largest font size where wrapped text fits bounding box. Uses Document AI `pixel_font_size` as primary estimate, falls back to OCR `wordH * 0.85`, then `boxH / line_count` heuristic.
-- **Font size normalization**: Spatially close regions with similar original font sizes (within 30% tolerance, 120px proximity) are grouped and re-fitted to the median `originalFontSize`. BFS anti-chaining prevents snowball grouping by checking new candidates against the group's full min/max range.
+- **Font sizing**: When Document AI `pixel_font_size` is available, it is used directly as the rendered font size. Otherwise, binary search for largest font size where wrapped text fits bounding box, capped by estimated original size (OCR `wordH * 1.0` or `boxH / line_count / 1.05` fallback).
+- **Font size normalization**: Spatially close regions with similar original font sizes (within 40% tolerance, 200px proximity) are grouped and all set to the max `originalFontSize` in the group. BFS anti-chaining prevents snowball grouping by checking new candidates against the group's full min/max range.
 - **Variable fonts**: Noto Sans supports weight axis — bold via `font.set_variation_by_name("Bold")`
 - **Base64 data URLs**: Images passed between frontend and backend as `data:image/png;base64,...`
 

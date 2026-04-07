@@ -964,6 +964,7 @@ function buildCanvas(data) {
         _boxH:      l.height,
         _alignment: alignment,
         _styleSpans: l.styleSpans || null,
+        _wordStyles: l.wordStyles || null,
         left:       l.x * baseScale,
         top:        l.y * baseScale,
       };
@@ -978,12 +979,74 @@ function buildCanvas(data) {
 
       const t = new fabric.Textbox(_addCJKBreaks(l.translatedText), opts);
 
-      // Apply per-character styles from Document AI styleSpans
-      if (l.styleSpans && l.styleSpans.length > 0) {
+      // Apply per-character styles — prefer word-level styles from HTML translation,
+      // fall back to proportional styleSpans mapping
+      if (l.wordStyles && l.wordStyles.length > 0) {
+        // Word-level styles from HTML-based styled translation
+        // Map word styles to per-character Fabric.js styles
         const fullText = t.text;
         const totalLen = fullText.length;
 
-        // Check if spans have significantly different colors (not just noise)
+        function _isCombiningWS(ch) {
+          const cp = ch.codePointAt(0);
+          if (!cp) return false;
+          if (cp >= 0x0300 && cp <= 0x036F) return true;
+          if (cp >= 0x0900 && cp <= 0x0903) return true;
+          if (cp >= 0x093A && cp <= 0x094F) return true;
+          if (cp >= 0x0951 && cp <= 0x0957) return true;
+          if (cp >= 0x0962 && cp <= 0x0963) return true;
+          if (cp === 0x200C || cp === 0x200D) return true;
+          return false;
+        }
+
+        // Build per-character bold/italic from word boundaries
+        const charBold = new Array(totalLen).fill(false);
+        const charItalic = new Array(totalLen).fill(false);
+        let searchPos = 0;
+        for (const ws of l.wordStyles) {
+          const word = ws.word;
+          const idx = fullText.indexOf(word, searchPos);
+          if (idx === -1) continue;
+          const isBold = ws.style && ws.style.fontWeight === "bold";
+          const isItalic = ws.style && ws.style.fontStyle === "italic";
+          for (let ci = idx; ci < idx + word.length; ci++) {
+            if (isBold) charBold[ci] = true;
+            if (isItalic) charItalic[ci] = true;
+          }
+          searchPos = idx + word.length;
+        }
+
+        const fabricStyles = {};
+        let lineIdx = 0, charIdx = 0;
+        let lastCharStyle = null;
+        for (let ci = 0; ci < totalLen; ci++) {
+          if (fullText[ci] === "\n") {
+            lineIdx++; charIdx = 0; lastCharStyle = null; continue;
+          }
+          let charStyle;
+          if (_isCombiningWS(fullText[ci]) && lastCharStyle) {
+            charStyle = Object.assign({}, lastCharStyle);
+          } else {
+            charStyle = {};
+            if (charBold[ci]) charStyle.fontWeight = "bold";
+            if (charItalic[ci]) charStyle.fontStyle = "italic";
+            lastCharStyle = Object.keys(charStyle).length > 0 ? charStyle : null;
+          }
+          if (charStyle && Object.keys(charStyle).length > 0) {
+            if (!fabricStyles[lineIdx]) fabricStyles[lineIdx] = {};
+            fabricStyles[lineIdx][charIdx] = charStyle;
+          }
+          charIdx++;
+        }
+        t.styles = fabricStyles;
+        console.log("[WordStyles]", l.translatedText.substring(0, 40),
+          "words:", l.wordStyles.length,
+          "boldWords:", l.wordStyles.filter(w => w.style && w.style.fontWeight === "bold").length);
+      } else if (l.styleSpans && l.styleSpans.length > 0) {
+        // Fallback: proportional styleSpans mapping
+        const fullText = t.text;
+        const totalLen = fullText.length;
+
         const parseHex = (h) => {
           if (!h || !h.startsWith("#") || h.length !== 7) return null;
           return [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
@@ -1001,12 +1064,10 @@ function buildCanvas(data) {
           }
         }
 
-        // Build per-character style array from proportional spans
-        // Use ci/totalLen so prop stays in [0, 1) — avoids off-by-one at end
         const charStyles = [];
         for (let ci = 0; ci < totalLen; ci++) {
           const prop = totalLen > 0 ? ci / totalLen : 0;
-          let matched = l.styleSpans[l.styleSpans.length - 1]; // default to last span
+          let matched = l.styleSpans[l.styleSpans.length - 1];
           for (const span of l.styleSpans) {
             if (span.start <= prop && prop < span.end) {
               matched = span;
@@ -1015,46 +1076,33 @@ function buildCanvas(data) {
           }
           charStyles.push(matched);
         }
-        // Helper: check if a Unicode char is a combining/dependent mark
-        // (Devanagari vowel signs, anusvara, visarga, nukta, virama, etc.)
         function _isCombining(ch) {
           const cp = ch.codePointAt(0);
           if (!cp) return false;
-          // Unicode combining marks (general)
           if (cp >= 0x0300 && cp <= 0x036F) return true;
-          // Devanagari dependent signs (vowel signs, anusvara, visarga, nukta, virama)
-          if (cp >= 0x0900 && cp <= 0x0903) return true;  // chandrabindu, anusvara, visarga
-          if (cp >= 0x093A && cp <= 0x094F) return true;  // nukta, vowel signs, virama
-          if (cp >= 0x0951 && cp <= 0x0957) return true;  // stress marks
-          if (cp >= 0x0962 && cp <= 0x0963) return true;  // vowel signs
-          // Zero-width joiners
+          if (cp >= 0x0900 && cp <= 0x0903) return true;
+          if (cp >= 0x093A && cp <= 0x094F) return true;
+          if (cp >= 0x0951 && cp <= 0x0957) return true;
+          if (cp >= 0x0962 && cp <= 0x0963) return true;
           if (cp === 0x200C || cp === 0x200D) return true;
           return false;
         }
 
-        // Build Fabric.js styles object keyed by unwrapped line index
-        // (Fabric 5.x Textbox: line 0 = all chars before first \n, survives reflow)
-        // Combining characters inherit the style of their preceding base character
         const fabricStyles = {};
         let lineIdx = 0, charIdx = 0;
         let lastCharStyle = null;
         for (let ci = 0; ci < totalLen; ci++) {
           if (fullText[ci] === "\n") {
-            lineIdx++;
-            charIdx = 0;
-            lastCharStyle = null;
-            continue;
+            lineIdx++; charIdx = 0; lastCharStyle = null; continue;
           }
           let charStyle;
           if (_isCombining(fullText[ci]) && lastCharStyle) {
-            // Combining mark: inherit style from preceding base character
             charStyle = Object.assign({}, lastCharStyle);
           } else {
             const span = charStyles[ci];
             charStyle = {};
             if (span.fontWeight === "bold") charStyle.fontWeight = "bold";
             if (span.fontStyle === "italic") charStyle.fontStyle = "italic";
-            // Only apply per-char color when spans have truly distinct colors
             if (hasDistinctColors && span.color) charStyle.fill = span.color;
             lastCharStyle = Object.keys(charStyle).length > 0 ? charStyle : null;
           }
@@ -1766,6 +1814,7 @@ btnExport.addEventListener("click", async () => {
       alignment:  o.textAlign || "center",
       angle:      o.angle || 0,
       styleSpans: o._styleSpans || null,
+      wordStyles: o._wordStyles || null,
     });
   });
 
