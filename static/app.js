@@ -999,9 +999,14 @@ function buildCanvas(data) {
           return false;
         }
 
-        // Build per-character bold/italic from word boundaries
+        // Build per-character bold/italic/color from word boundaries
         const charBold = new Array(totalLen).fill(false);
         const charItalic = new Array(totalLen).fill(false);
+        const charColor = new Array(totalLen).fill(null);
+        function _parseHex(h) {
+          if (!h || typeof h !== "string" || !h.startsWith("#") || h.length !== 7) return null;
+          return [parseInt(h.substr(1,2),16), parseInt(h.substr(3,2),16), parseInt(h.substr(5,2),16)];
+        }
         let searchPos = 0;
         for (const ws of l.wordStyles) {
           const word = ws.word;
@@ -1009,9 +1014,11 @@ function buildCanvas(data) {
           if (idx === -1) continue;
           const isBold = ws.style && ws.style.fontWeight === "bold";
           const isItalic = ws.style && ws.style.fontStyle === "italic";
+          const col = ws.style && ws.style.color;
           for (let ci = idx; ci < idx + word.length; ci++) {
             if (isBold) charBold[ci] = true;
             if (isItalic) charItalic[ci] = true;
+            if (col) charColor[ci] = col;
           }
           searchPos = idx + word.length;
         }
@@ -1030,6 +1037,7 @@ function buildCanvas(data) {
             charStyle = {};
             if (charBold[ci]) charStyle.fontWeight = "bold";
             if (charItalic[ci]) charStyle.fontStyle = "italic";
+            if (charColor[ci]) charStyle.fill = charColor[ci];
             lastCharStyle = Object.keys(charStyle).length > 0 ? charStyle : null;
           }
           if (charStyle && Object.keys(charStyle).length > 0) {
@@ -1768,6 +1776,71 @@ workspace.addEventListener("wheel", e => {
   }
 }, { passive: false });
 
+// Rebuild wordStyles from current Fabric Textbox state (honors user edits).
+// Uses per-character overrides in o.styles; falls back to the original
+// _wordStyles when the user hasn't touched styles for a word.
+function _extractWordStylesFromFabric(o) {
+  const text = o.text || "";
+  if (!text) return o._wordStyles || null;
+  const entries = [];
+  const re = /\S+/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const word = m[0];
+    const start = m.index;
+    const end = start + word.length;
+    // Textbox-level defaults (set by Bold/Italic buttons or color picker)
+    const defWeight = o.fontWeight === "bold" ? "bold" : "normal";
+    const defStyle = o.fontStyle === "italic" ? "italic" : "normal";
+    const defColor = _normalizeHex(o.fill);
+    // Gather per-char styles with fallback to object defaults
+    const charStyles = [];
+    for (let pos = start; pos < end; pos++) {
+      let cs = {};
+      try {
+        cs = (o.getStyleAtPosition && o.getStyleAtPosition(pos, false)) || {};
+      } catch (e) { cs = {}; }
+      const weight = cs.fontWeight === "bold" ? "bold"
+                     : cs.fontWeight === "normal" ? "normal" : defWeight;
+      const style = cs.fontStyle === "italic" ? "italic"
+                    : cs.fontStyle === "normal" ? "normal" : defStyle;
+      const color = _normalizeHex(cs.fill) || defColor || null;
+      charStyles.push({ fontWeight: weight, fontStyle: style, color });
+    }
+    // Group consecutive chars with identical style into runs
+    let i = 0, first = true;
+    while (i < charStyles.length) {
+      const s = charStyles[i];
+      let j = i + 1;
+      while (j < charStyles.length
+             && charStyles[j].fontWeight === s.fontWeight
+             && charStyles[j].fontStyle === s.fontStyle
+             && charStyles[j].color === s.color) j++;
+      const run = word.slice(i, j);
+      const style = { fontWeight: s.fontWeight, fontStyle: s.fontStyle };
+      if (s.color) style.color = s.color;
+      const entry = { word: run, style };
+      if (!first) entry.gluePrev = true;  // part of same source-word
+      entries.push(entry);
+      first = false;
+      i = j;
+    }
+  }
+  return entries.length ? entries : (o._wordStyles || null);
+}
+
+function _normalizeHex(c) {
+  if (!c) return null;
+  if (typeof c === "string" && c.startsWith("#") && c.length === 7) return c;
+  // rgb(r,g,b) or rgba(...)
+  const m = typeof c === "string" ? c.match(/rgba?\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i) : null;
+  if (m) {
+    const h = (n) => parseInt(n, 10).toString(16).padStart(2, "0");
+    return "#" + h(m[1]) + h(m[2]) + h(m[3]);
+  }
+  return null;
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Export → Phase 4 (server-side render)
 // ══════════════════════════════════════════════════════════════════════════
@@ -1814,7 +1887,12 @@ btnExport.addEventListener("click", async () => {
       alignment:  o.textAlign || "center",
       angle:      o.angle || 0,
       styleSpans: o._styleSpans || null,
-      wordStyles: o._wordStyles || null,
+      wordStyles: (function(){
+        const ws = _extractWordStylesFromFabric(o);
+        console.log("[ExportWS]", (o.text||"").substring(0,40),
+          "styles:", o.styles, "out:", ws);
+        return ws;
+      })(),
     });
   });
 

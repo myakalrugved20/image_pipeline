@@ -238,30 +238,38 @@ def _build_styled_html(orig_text: str, style_spans: list[dict]) -> str:
     if text_len == 0:
         return ""
 
-    # Build per-character bold/italic array
+    # Build per-character bold/italic/color arrays
     char_bold = [False] * text_len
     char_italic = [False] * text_len
+    char_color: list[str | None] = [None] * text_len
     for span in style_spans:
         s = int(span["start"] * text_len)
         e = min(int(span["end"] * text_len), text_len)
         is_bold = span.get("fontWeight", "normal").lower() == "bold"
         is_italic = span.get("fontStyle", "normal").lower() == "italic"
+        color = span.get("color")
         for ci in range(s, e):
             if is_bold:
                 char_bold[ci] = True
             if is_italic:
                 char_italic[ci] = True
+            if color:
+                char_color[ci] = color
 
-    # Build HTML by grouping consecutive chars with same bold/italic state
+    # Group consecutive chars with same (bold, italic, color) state
     result = []
     i = 0
     while i < text_len:
         b = char_bold[i]
         it = char_italic[i]
+        col = char_color[i]
         j = i + 1
-        while j < text_len and char_bold[j] == b and char_italic[j] == it:
+        while (j < text_len and char_bold[j] == b
+               and char_italic[j] == it and char_color[j] == col):
             j += 1
         segment = html_module.escape(orig_text[i:j])
+        if col:
+            segment = f'<span style="color:{col}">{segment}</span>'
         if b and it:
             segment = f"<b><i>{segment}</i></b>"
         elif b:
@@ -283,13 +291,16 @@ def _parse_styled_translation(html_text: str) -> list[dict]:
     # Remove any wrapping tags Google might add
     text = html_text.strip()
 
-    # Track bold/italic state while walking through the HTML
+    # Track bold/italic/color state while walking through the HTML
     words_with_styles = []
     current_word = []
     current_bold = False
     current_italic = False
     tag_stack_bold = 0
     tag_stack_italic = 0
+    color_stack: list[str] = []
+
+    color_re = re.compile(r"color\s*:\s*(#[0-9a-fA-F]{3,8}|rgb\([^)]+\))", re.IGNORECASE)
 
     i = 0
     while i < len(text):
@@ -300,81 +311,85 @@ def _parse_styled_translation(html_text: str) -> list[dict]:
                 current_word.append(text[i])
                 i += 1
                 continue
-            tag = text[i+1:end].strip().lower()
-            if tag == 'b' or tag == 'strong':
+            raw_tag = text[i+1:end].strip()
+            tag = raw_tag.lower()
+            tag_name = tag.split(None, 1)[0] if tag else ""
+            if tag_name == 'b' or tag_name == 'strong':
                 tag_stack_bold += 1
                 current_bold = True
-            elif tag == '/b' or tag == '/strong':
+            elif tag_name == '/b' or tag_name == '/strong':
                 tag_stack_bold = max(0, tag_stack_bold - 1)
                 current_bold = tag_stack_bold > 0
-            elif tag == 'i' or tag == 'em':
+            elif tag_name == 'i' or tag_name == 'em' or tag_name == 'em/':
                 tag_stack_italic += 1
                 current_italic = True
-            elif tag == '/i' or tag == '/em':
+            elif tag_name == '/i' or tag_name == '/em':
                 tag_stack_italic = max(0, tag_stack_italic - 1)
                 current_italic = tag_stack_italic > 0
-            # Skip other tags (span, etc.)
+            elif tag_name == 'span':
+                m = color_re.search(raw_tag)
+                color_stack.append(m.group(1) if m else "")
+            elif tag_name == '/span':
+                if color_stack:
+                    color_stack.pop()
+            # Skip other tags
             i = end + 1
             continue
 
+        def _flush():
+            if not current_word:
+                return
+            word_str = "".join(c for c, _, _, _ in current_word)
+            n = len(current_word)
+            bold_count = sum(1 for _, b, _, _ in current_word if b)
+            italic_count = sum(1 for _, _, it, _ in current_word if it)
+            colors = [col for _, _, _, col in current_word if col]
+            style: dict = {
+                "fontWeight": "bold" if bold_count > n / 2 else "normal",
+                "fontStyle": "italic" if italic_count > n / 2 else "normal",
+            }
+            if colors:
+                # Most common color among colored chars
+                style["color"] = max(set(colors), key=colors.count)
+            words_with_styles.append({"word": word_str, "style": style})
+            current_word.clear()
+
+        cur_color = color_stack[-1] if color_stack else None
+
         if text[i] == '&':
-            # HTML entity
             end = text.find(';', i)
             if end != -1:
                 entity = text[i:end+1]
                 decoded = html_module.unescape(entity)
                 if decoded == ' ':
-                    # Space — flush current word
-                    if current_word:
-                        word_str = "".join(c for c, _, _ in current_word)
-                        # Use majority vote for bold/italic in the word
-                        bold_count = sum(1 for _, b, _ in current_word if b)
-                        italic_count = sum(1 for _, _, it in current_word if it)
-                        words_with_styles.append({
-                            "word": word_str,
-                            "style": {
-                                "fontWeight": "bold" if bold_count > len(current_word) / 2 else "normal",
-                                "fontStyle": "italic" if italic_count > len(current_word) / 2 else "normal",
-                            }
-                        })
-                        current_word = []
+                    _flush()
                 else:
                     for ch in decoded:
-                        current_word.append((ch, current_bold, current_italic))
+                        current_word.append((ch, current_bold, current_italic, cur_color))
                 i = end + 1
                 continue
 
         ch = text[i]
         if ch in (' ', '\n', '\t'):
-            # Flush current word
-            if current_word:
-                word_str = "".join(c for c, _, _ in current_word)
-                bold_count = sum(1 for _, b, _ in current_word if b)
-                italic_count = sum(1 for _, _, it in current_word if it)
-                words_with_styles.append({
-                    "word": word_str,
-                    "style": {
-                        "fontWeight": "bold" if bold_count > len(current_word) / 2 else "normal",
-                        "fontStyle": "italic" if italic_count > len(current_word) / 2 else "normal",
-                    }
-                })
-                current_word = []
+            _flush()
         else:
-            current_word.append((ch, current_bold, current_italic))
+            current_word.append((ch, current_bold, current_italic, cur_color))
         i += 1
 
     # Flush last word
     if current_word:
-        word_str = "".join(c for c, _, _ in current_word)
-        bold_count = sum(1 for _, b, _ in current_word if b)
-        italic_count = sum(1 for _, _, it in current_word if it)
-        words_with_styles.append({
-            "word": word_str,
-            "style": {
-                "fontWeight": "bold" if bold_count > len(current_word) / 2 else "normal",
-                "fontStyle": "italic" if italic_count > len(current_word) / 2 else "normal",
-            }
-        })
+        word_str = "".join(c for c, _, _, _ in current_word)
+        n = len(current_word)
+        bold_count = sum(1 for _, b, _, _ in current_word if b)
+        italic_count = sum(1 for _, _, it, _ in current_word if it)
+        colors = [col for _, _, _, col in current_word if col]
+        style: dict = {
+            "fontWeight": "bold" if bold_count > n / 2 else "normal",
+            "fontStyle": "italic" if italic_count > n / 2 else "normal",
+        }
+        if colors:
+            style["color"] = max(set(colors), key=colors.count)
+        words_with_styles.append({"word": word_str, "style": style})
 
     return words_with_styles
 
@@ -394,10 +409,11 @@ def translate_text_styled(orig_text: str, style_spans: list[dict] | None,
         result = translate_texts([orig_text], source, target)
         return result[0] if result else orig_text, None
 
-    # Check if there are any bold or italic spans
+    # Check if there are any bold, italic, or colored spans
     has_styled = any(
         s.get("fontWeight", "normal").lower() == "bold" or
-        s.get("fontStyle", "normal").lower() == "italic"
+        s.get("fontStyle", "normal").lower() == "italic" or
+        s.get("color")
         for s in style_spans
     )
     if not has_styled:
@@ -770,6 +786,60 @@ def detect_underline(
     return False
 
 
+def _sample_token_color_px(
+    crop: np.ndarray,
+    bg_ref: tuple[float, float, float] | None = None,
+) -> tuple[int, int, int] | None:
+    """Sample text color from a token-sized RGB crop via K-means (k=2).
+
+    If bg_ref (reference background RGB) is provided, the cluster whose centroid
+    is *farther* from bg_ref is treated as text. Otherwise falls back to picking
+    the minority cluster as text. Returns median RGB of text pixels, or None.
+    """
+    if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
+        return None
+    pixels = crop.reshape(-1, 3).astype(float)
+    if pixels.shape[0] < 4:
+        return None
+    try:
+        km = KMeans(n_clusters=2, n_init=3, random_state=0)
+        labels = km.fit_predict(pixels)
+        counts = np.bincount(labels, minlength=2)
+        if bg_ref is not None:
+            d0 = sum(abs(km.cluster_centers_[0, k] - bg_ref[k]) for k in range(3))
+            d1 = sum(abs(km.cluster_centers_[1, k] - bg_ref[k]) for k in range(3))
+            text_label = 0 if d0 > d1 else 1
+        else:
+            text_label = int(np.argmin(counts))
+        text_pixels = pixels[labels == text_label]
+        if len(text_pixels) == 0:
+            return None
+        median = np.median(text_pixels, axis=0).astype(int)
+        return int(median[0]), int(median[1]), int(median[2])
+    except Exception:
+        return None
+
+
+def _estimate_bg_from_border(
+    img: np.ndarray, x0: int, y0: int, x1: int, y1: int, pad: int = 3
+) -> tuple[float, float, float] | None:
+    """Median color of a thin frame just outside the [x0,y0,x1,y1] bbox."""
+    h, w = img.shape[:2]
+    ox0 = max(0, x0 - pad); oy0 = max(0, y0 - pad)
+    ox1 = min(w, x1 + pad); oy1 = min(h, y1 + pad)
+    if ox1 - ox0 < 3 or oy1 - oy0 < 3:
+        return None
+    top = img[oy0:y0, ox0:ox1].reshape(-1, 3) if y0 > oy0 else np.empty((0, 3))
+    bot = img[y1:oy1, ox0:ox1].reshape(-1, 3) if oy1 > y1 else np.empty((0, 3))
+    lft = img[y0:y1, ox0:x0].reshape(-1, 3) if x0 > ox0 else np.empty((0, 3))
+    rgt = img[y0:y1, x1:ox1].reshape(-1, 3) if ox1 > x1 else np.empty((0, 3))
+    border = np.concatenate([top, bot, lft, rgt], axis=0)
+    if border.shape[0] < 3:
+        return None
+    med = np.median(border, axis=0)
+    return float(med[0]), float(med[1]), float(med[2])
+
+
 def detect_font_styles_docai(image_bytes: bytes) -> dict | None:
     """Call Google Document AI to get font style metadata.
 
@@ -802,6 +872,14 @@ def detect_font_styles_docai(image_bytes: bytes) -> dict | None:
         result = client.process_document(request=request)
         document = result.document
         full_text = document.text or ""
+
+        # Decode image once for per-token pixel color sampling
+        try:
+            img_for_sampling = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+            img_h, img_w = img_for_sampling.shape[:2]
+        except Exception:
+            img_for_sampling = None
+            img_h = img_w = 0
 
         # Build style entries from token-level style_info
         styles = []
@@ -849,8 +927,33 @@ def detect_font_styles_docai(image_bytes: bytes) -> dict | None:
                     style_entry["fontFamily"] = "serif"
                 elif ft:
                     style_entry["fontFamily"] = "sans-serif"
-                # Color — from style_info.text_color (0.0–1.0 floats)
-                if si.text_color:
+                # Color — prefer pixel-sampled color from token bbox (DocAI's
+                # text_color is quantized and often returns grayscale for
+                # colored text). Fall back to DocAI text_color if sampling fails.
+                sampled = None
+                if img_for_sampling is not None and token.layout and token.layout.bounding_poly:
+                    try:
+                        nv = token.layout.bounding_poly.normalized_vertices
+                        if nv and len(nv) >= 3:
+                            xs = [v.x * img_w for v in nv]
+                            ys = [v.y * img_h for v in nv]
+                            x0 = max(0, int(min(xs)))
+                            y0 = max(0, int(min(ys)))
+                            x1 = min(img_w, int(max(xs)) + 1)
+                            y1 = min(img_h, int(max(ys)) + 1)
+                            if x1 - x0 >= 2 and y1 - y0 >= 2:
+                                bg_ref = _estimate_bg_from_border(
+                                    img_for_sampling, x0, y0, x1, y1
+                                )
+                                sampled = _sample_token_color_px(
+                                    img_for_sampling[y0:y1, x0:x1], bg_ref=bg_ref
+                                )
+                    except Exception:
+                        sampled = None
+                if sampled is not None:
+                    r, g, b = sampled
+                    style_entry["color"] = f"#{r:02x}{g:02x}{b:02x}"
+                elif si.text_color:
                     r = int((si.text_color.red or 0) * 255)
                     g = int((si.text_color.green or 0) * 255)
                     b = int((si.text_color.blue or 0) * 255)
@@ -1307,27 +1410,6 @@ def _wrap_text_styled(
     if not word_styles:
         return []
 
-    # Check if word styles have significantly different colors (not just noise)
-    def _parse_hex(h):
-        if not h or not h.startswith("#") or len(h) != 7:
-            return None
-        return (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
-
-    span_colors = [_parse_hex(ws["style"].get("color")) for ws in word_styles]
-    span_colors = [c for c in span_colors if c]
-    has_distinct_colors = False
-    if len(span_colors) >= 2:
-        for i in range(len(span_colors)):
-            if has_distinct_colors:
-                break
-            for j in range(i + 1, len(span_colors)):
-                dist = (abs(span_colors[i][0] - span_colors[j][0])
-                        + abs(span_colors[i][1] - span_colors[j][1])
-                        + abs(span_colors[i][2] - span_colors[j][2]))
-                if dist > 150:
-                    has_distinct_colors = True
-                    break
-
     # Build font and measure width for each word
     entries = []
     for ws in word_styles:
@@ -1338,8 +1420,7 @@ def _wrap_text_styled(
         font = get_font(target_lang, base_font_size, bold=is_bold, italic=is_italic, font_family=ff)
         bbox = font.getbbox(ws["word"])
         w = bbox[2] - bbox[0]
-        # Only use per-word color when spans have truly distinct colors
-        color_hex = st.get("color") if has_distinct_colors else None
+        color_hex = st.get("color")
         underline = "underline" in st.get("textDecoration", "").lower() if st.get("textDecoration") else False
         entries.append({
             "word": ws["word"],
@@ -1348,6 +1429,7 @@ def _wrap_text_styled(
             "width": w,
             "bold": is_bold,
             "underline": underline,
+            "glue_prev": bool(ws.get("gluePrev")),
         })
 
     # Greedy line wrapping (respects explicit \n in words)
@@ -1382,8 +1464,11 @@ def _wrap_text_styled(
                     current_w = 0
             continue
 
-        test_w = current_w + (space_w if current_line else 0) + entry["width"]
-        if test_w <= max_width or not current_line:
+        glue = entry.get("glue_prev")
+        sep_w = 0 if glue else (space_w if current_line else 0)
+        test_w = current_w + sep_w + entry["width"]
+        # Never wrap between glued entries (same source-word) — keep them together
+        if test_w <= max_width or not current_line or glue:
             current_line.append(entry)
             current_w = test_w
         else:
@@ -1420,9 +1505,12 @@ def _render_styled_lines(
     cy = y + max(0, (box_h - total_h) // 2)
 
     for line, lh in zip(lines, line_heights):
-        # Compute line width
+        # Compute line width (skip space before glued entries)
         space_w = line[0]["font"].getbbox(" ")[2] - line[0]["font"].getbbox(" ")[0] if line else 4
-        line_w = sum(e["width"] for e in line) + space_w * max(0, len(line) - 1)
+        line_w = sum(e["width"] for e in line)
+        for idx in range(1, len(line)):
+            if not line[idx].get("glue_prev"):
+                line_w += space_w
 
         if alignment == "left":
             cx = x
@@ -1451,7 +1539,7 @@ def _render_styled_lines(
                           fill=fill, width=ul_thick)
 
             cx += entry["width"]
-            if i < len(line) - 1:
+            if i < len(line) - 1 and not line[i + 1].get("glue_prev"):
                 cx += space_w
 
         cy += lh
