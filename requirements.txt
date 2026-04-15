@@ -13,3 +13,4 @@ opencv-python-headless
 jinja2
 google-cloud-documentai
 python-dotenv
+
