@@ -2,7 +2,9 @@ import os
 import sys
 from dotenv import load_dotenv
 load_dotenv()
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+# Force CPU only for local dev (Windows) — on HF Spaces we want the T4 GPU.
+if not os.environ.get("SPACE_ID"):
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 if sys.stdout.encoding and sys.stdout.encoding.lower().startswith("cp"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -62,8 +64,10 @@ _lama = None
 def get_lama():
     global _lama
     if _lama is None:
-        print("Loading LaMa inpainting model …")
-        if not torch.cuda.is_available():
+        cuda_ok = torch.cuda.is_available()
+        device_name = torch.cuda.get_device_name(0) if cuda_ok else "cpu"
+        print(f"Loading LaMa inpainting model … (CUDA={cuda_ok}, device={device_name})")
+        if not cuda_ok:
             _orig_jit_load = torch.jit.load
             torch.jit.load = lambda f, **kw: _orig_jit_load(f, **{**kw, "map_location": "cpu"})
             _lama = SimpleLama()

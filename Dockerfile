@@ -1,15 +1,20 @@
-FROM python:3.12-slim
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 
-# System deps for OpenCV and Pillow
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# Python + system deps for OpenCV / Pillow
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-dev \
     libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
     zlib1g-dev libjpeg-dev libpng-dev libfreetype6-dev \
     build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/bin/python
 
 WORKDIR /app
 
-# Install Python deps
+# Install Python deps (pulls CUDA-enabled torch via extra-index-url in requirements.txt)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
