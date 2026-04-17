@@ -2,9 +2,7 @@ import os
 import sys
 from dotenv import load_dotenv
 load_dotenv()
-# Force CPU only for local dev (Windows) — on HF Spaces we want the T4 GPU.
-if not os.environ.get("SPACE_ID"):
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+# On HF Spaces we use the T4 GPU; locally use GPU if available.
 if sys.stdout.encoding and sys.stdout.encoding.lower().startswith("cp"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -564,8 +562,96 @@ def create_mask(image_size: tuple[int, int], regions: list[dict],
 
 # ── Inpainting ────────────────────────────────────────────────────────────
 
-def inpaint(image: Image.Image, mask: Image.Image) -> Image.Image:
-    """Remove text using LaMa."""
+def _gradient_fill(img_arr: np.ndarray, mask_arr: np.ndarray) -> np.ndarray:
+    """Fill masked regions by interpolating from border pixels.
+
+    For each connected masked region, samples a band of pixels just outside
+    the mask boundary and uses distance-weighted interpolation to produce a
+    smooth gradient fill.  Works best on solid / linear-gradient backgrounds.
+    """
+    from scipy.ndimage import distance_transform_edt, label as ndlabel
+    result = img_arr.copy()
+    binary = (mask_arr > 127).astype(np.uint8)
+    if binary.sum() == 0:
+        return result
+
+    # Label connected components so each region is filled independently
+    labeled, n_components = ndlabel(binary)
+
+    # Border band: dilate mask and subtract original to get surrounding pixels
+    band_px = 12
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (band_px * 2 + 1, band_px * 2 + 1))
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+    border_band = dilated.astype(bool) & ~binary.astype(bool)
+
+    for comp_id in range(1, n_components + 1):
+        comp_mask = (labeled == comp_id)
+        # Expand border band slightly per-component for better sampling
+        comp_dilated = cv2.dilate(comp_mask.astype(np.uint8), kernel, iterations=1)
+        comp_border = comp_dilated.astype(bool) & ~comp_mask
+
+        # Collect border pixel coords and colors
+        by, bx = np.where(comp_border)
+        if len(by) < 3:
+            # Too few border pixels, fall back to Navier-Stokes
+            comp_mask_u8 = (comp_mask.astype(np.uint8)) * 255
+            result = cv2.inpaint(result, comp_mask_u8, 7, cv2.INPAINT_NS)
+            continue
+
+        border_colors = img_arr[by, bx].astype(np.float64)  # (N, 3)
+
+        # Filter out outlier border pixels (e.g. divider lines, icons) that
+        # don't match the dominant background.  Use median as the robust
+        # center and keep pixels within a tolerance.
+        median_color = np.median(border_colors, axis=0)
+        diffs = np.linalg.norm(border_colors - median_color, axis=1)
+        threshold = max(60.0, np.percentile(diffs, 75) * 1.5)
+        keep = diffs < threshold
+        if keep.sum() >= 3:
+            by, bx = by[keep], bx[keep]
+            border_colors = border_colors[keep]
+
+        my, mx = np.where(comp_mask)
+        n_mask = len(my)
+        n_border = len(by)
+
+        # Process in batches to limit memory usage
+        batch = 4096
+        for start in range(0, n_mask, batch):
+            end = min(start + batch, n_mask)
+            # (batch, 1) - (1, n_border) → (batch, n_border)
+            dy = my[start:end, None].astype(np.float64) - by[None, :]
+            dx = mx[start:end, None].astype(np.float64) - bx[None, :]
+            d2 = dx * dx + dy * dy
+            d2[d2 == 0] = 0.01
+            weights = 1.0 / d2  # (batch, n_border)
+
+            # Subsample border pixels when there are too many (for speed)
+            if n_border > 500:
+                idx = np.linspace(0, n_border - 1, 500, dtype=int)
+                weights = weights[:, idx]
+                bc = border_colors[idx]
+            else:
+                bc = border_colors
+
+            w_sum = weights.sum(axis=1, keepdims=True)
+            weights /= w_sum
+            colors = weights @ bc  # (batch, 3)
+            result[my[start:end], mx[start:end]] = np.clip(colors, 0, 255).astype(np.uint8)
+
+    return result
+
+
+def inpaint(image: Image.Image, mask: Image.Image,
+            method: str = "lama") -> Image.Image:
+    """Remove text using the chosen inpainting method."""
+    if method == "opencv":
+        img_arr = np.array(image.convert("RGB"))
+        mask_arr = np.array(mask.convert("L"))
+        result_arr = _gradient_fill(img_arr, mask_arr)
+        return Image.fromarray(result_arr)
+    # Default: LaMa neural inpainting
     result = get_lama()(image.convert("RGB"), mask.convert("L"))
     return result
 
@@ -579,10 +665,12 @@ def _region_area(region: dict) -> int:
 
 
 def inpaint_sequential(image: Image.Image, regions: list[dict],
-                       mask_mode: str = "precise") -> Image.Image:
+                       mask_mode: str = "precise",
+                       inpaint_method: str = "lama") -> Image.Image:
     """Inpaint regions one at a time, smallest first, for better quality.
 
     mask_mode: "precise" uses text-pixel detection, "fill" uses polygon fill.
+    inpaint_method: "lama" (neural) or "opencv" (Telea, best for gradients).
     """
     if not regions:
         return image
@@ -590,12 +678,12 @@ def inpaint_sequential(image: Image.Image, regions: list[dict],
     # Fallback to single pass when there are many regions (performance)
     if len(regions) > 15:
         mask = create_mask(image.size, regions, image=use_image)
-        return inpaint(image, mask)
+        return inpaint(image, mask, method=inpaint_method)
     sorted_regions = sorted(regions, key=_region_area)
     current = image
     for r in sorted_regions:
         mask = create_mask(current.size, [r], image=current if mask_mode == "precise" else None)
-        current = inpaint(current, mask)
+        current = inpaint(current, mask, method=inpaint_method)
     return current
 
 
@@ -2046,6 +2134,7 @@ async def phase1_clean(request: Request):
     selected_regions = body.get("selected_regions", [])
     target_lang = body.get("target_lang", "en")
     mask_mode = body.get("mask_mode", "precise")  # "precise" or "fill"
+    inpaint_method = body.get("inpaint_method", "lama")  # "lama" or "opencv"
 
     try:
         original = data_url_to_image(original_image)
@@ -2087,7 +2176,7 @@ async def phase1_clean(request: Request):
             return None
 
     async def _inpaint_task():
-        return await asyncio.to_thread(inpaint_sequential, original, mask_regions, mask_mode)
+        return await asyncio.to_thread(inpaint_sequential, original, mask_regions, mask_mode, inpaint_method)
 
     # Run Document AI and inpainting concurrently
     docai_styles, inpainted = await asyncio.gather(_docai_task(), _inpaint_task())
@@ -2243,6 +2332,8 @@ async def manual_inpaint(request: Request):
     image_data = body.get("image", "")
     rectangles = body.get("rectangles", [])
 
+    inpaint_method = body.get("inpaint_method", "lama")
+
     if not image_data or not rectangles:
         raise HTTPException(400, "image and rectangles required")
 
@@ -2267,7 +2358,7 @@ async def manual_inpaint(request: Request):
         mask_arr = np.maximum(mask_arr, temp_arr)
 
     mask = Image.fromarray(mask_arr)
-    result = inpaint(image, mask)
+    result = inpaint(image, mask, method=inpaint_method)
 
     return JSONResponse({"clean": image_to_data_url(result)})
 

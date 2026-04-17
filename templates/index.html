@@ -98,6 +98,12 @@
             <option value="fill">Fill</option>
           </select>
         </label>
+        <label class="tb-label" for="inpaint-method" title="LaMa: neural network, good for complex textures. OpenCV: Telea algorithm, best for solid/gradient backgrounds (faster, no artifacts).">Inpaint:
+          <select id="inpaint-method" class="tb-select">
+            <option value="lama">LaMa</option>
+            <option value="opencv">OpenCV</option>
+          </select>
+        </label>
         <span class="tb-sep"></span>
         <span id="sel-count" class="tb-label">0 selected</span>
         <button id="sel-clean" class="tb-btn tb-export">Clean Selected &rarr;</button>

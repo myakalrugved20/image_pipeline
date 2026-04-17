@@ -331,16 +331,17 @@ function buildBox(props) {
   return r;
 }
 
-/* Delete whichever box is Fabric-active */
-function deleteActiveBox() {
+/* Delete all selected boxes (blue/green ones with _selected = true) */
+function deleteSelectedBoxes() {
   if (!selFc) return;
-  var a = selFc.getActiveObject();
-  if (a && (a._isOcrRegion || a._isCustomRegion)) {
-    selFc.remove(a);
-    selFc.discardActiveObject();
-    selFc.renderAll();
-    updateSelCount();
-  }
+  var toRemove = selFc.getObjects().filter(function(o) {
+    return (o._isOcrRegion || o._isCustomRegion) && o._selected;
+  });
+  if (toRemove.length === 0) return;
+  selFc.discardActiveObject();
+  toRemove.forEach(function(o) { selFc.remove(o); });
+  selFc.renderAll();
+  updateSelCount();
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -458,8 +459,24 @@ function openSelectionPhase() {
     selFc.on("object:moving",  function() { _didDrag = true; });
     selFc.on("object:scaling", function() { _didDrag = true; });
 
-    selFc.on("mouse:down", function() {
+    selFc.on("mouse:down", function(opt) {
       _didDrag = false;
+      /* start lasso selection when clicking empty space outside draw mode */
+      if (!drawMode && !opt.target) {
+        var ptr = selFc.getPointer(opt.e);
+        _lassoOrigin = { x: ptr.x, y: ptr.y };
+        _lassoRect = new fabric.Rect({
+          left: ptr.x, top: ptr.y, width: 0, height: 0,
+          fill:            "rgba(205,214,244,0.08)",
+          stroke:          "rgba(205,214,244,0.7)",
+          strokeWidth:     1,
+          strokeDashArray: [4, 4],
+          selectable:      false,
+          evented:         false,
+          excludeFromExport: true,
+        });
+        selFc.add(_lassoRect);
+      }
     });
 
     selFc.on("mouse:up", function(opt) {
@@ -489,6 +506,8 @@ function openSelectionPhase() {
     /* ── draw mode ─────────────────────────────────────────────────────── */
     var _drawOrigin = null;
     var _drawRect   = null;
+    var _lassoOrigin = null;
+    var _lassoRect   = null;
 
     selFc.on("mouse:down", function(opt) {
       if (!drawMode) return;
@@ -522,6 +541,19 @@ function openSelectionPhase() {
       selFc.renderAll();
     });
 
+    /* ── lasso drag-select ────────────────────────────────────────────── */
+    selFc.on("mouse:move", function(opt) {
+      if (!_lassoOrigin || !_lassoRect) return;
+      var ptr = selFc.getPointer(opt.e);
+      _lassoRect.set({
+        left:   Math.min(_lassoOrigin.x, ptr.x),
+        top:    Math.min(_lassoOrigin.y, ptr.y),
+        width:  Math.abs(ptr.x - _lassoOrigin.x),
+        height: Math.abs(ptr.y - _lassoOrigin.y),
+      });
+      selFc.renderAll();
+    });
+
     selFc.on("mouse:up", function() {
       if (!drawMode || !_drawRect) return;
       if (_drawRect.width < 5 || _drawRect.height < 5) {
@@ -550,6 +582,30 @@ function openSelectionPhase() {
       updateSelCount();
     });
 
+    selFc.on("mouse:up", function() {
+      if (!_lassoRect) return;
+      if (_lassoRect.width > 3 && _lassoRect.height > 3) {
+        var lL = _lassoRect.left,  lT = _lassoRect.top;
+        var lR = lL + _lassoRect.width, lB = lT + _lassoRect.height;
+        selFc.getObjects().forEach(function(obj) {
+          if (obj === _lassoRect) return;
+          if (!obj._isOcrRegion && !obj._isCustomRegion) return;
+          var sx = obj.scaleX || 1, sy = obj.scaleY || 1;
+          var oL = obj.left, oT = obj.top;
+          var oR = oL + obj.width * sx, oB = oT + obj.height * sy;
+          if (oL < lR && oR > lL && oT < lB && oB > lT) {
+            obj._selected = true;
+            styleBox(obj);
+          }
+        });
+        updateSelCount();
+      }
+      selFc.remove(_lassoRect);
+      _lassoOrigin = null;
+      _lassoRect   = null;
+      selFc.renderAll();
+    });
+
     /* Magnifier tracking ------------------------------------------------- */
     selFc.on("mouse:move", function(opt) {
       if (!magnifierCtx || !magnifierImg) return;
@@ -567,11 +623,8 @@ function openSelectionPhase() {
 function _selKeyHandler(e) {
   if (appPhase !== "select" || !selFc) return;
   if (e.key === "Delete" || e.key === "Backspace") {
-    var a = selFc.getActiveObject();
-    if (a && (a._isOcrRegion || a._isCustomRegion)) {
-      e.preventDefault();
-      deleteActiveBox();
-    }
+    e.preventDefault();
+    deleteSelectedBoxes();
   }
 }
 
@@ -610,7 +663,7 @@ selDeselectAll.addEventListener("click", function() {
   updateSelCount();
 });
 
-if (selDelete) selDelete.addEventListener("click", deleteActiveBox);
+if (selDelete) selDelete.addEventListener("click", deleteSelectedBoxes);
 
 selDraw.addEventListener("click", function() {
   drawMode = !drawMode;
@@ -688,6 +741,7 @@ selClean.addEventListener("click", async () => {
         selected_regions: selectedRegions,
         target_lang: targetLang.value,
         mask_mode: document.getElementById("mask-mode").value,
+        inpaint_method: document.getElementById("inpaint-method").value,
       }),
     });
     if (!res.ok) {
@@ -859,7 +913,7 @@ p1ApplyCleanup.addEventListener("click", async function() {
     var resp = await fetch("/manual-inpaint", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: phaseData.clean, rectangles: rectangles }),
+      body: JSON.stringify({ image: phaseData.clean, rectangles: rectangles, inpaint_method: document.getElementById("inpaint-method").value }),
     });
     if (!resp.ok) throw new Error("Cleanup failed");
     var data = await resp.json();
