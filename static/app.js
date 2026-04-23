@@ -80,6 +80,7 @@ let appPhase      = "upload";   // "upload" | "select" | "review" | "editor" | "
 let detectData    = null;       // Stores /phase1-detect response
 let phaseData     = null;       // Stores /phase1-clean response
 let drawMode      = false;
+let deleteMode    = false;
 let cleanupMode   = false;
 let cleanupFc     = null;
 let cleanupScale  = 1;
@@ -106,8 +107,8 @@ const selectView   = document.getElementById("select-view");
 const selBack      = document.getElementById("sel-back");
 const selSelectAll = document.getElementById("sel-select-all");
 const selDeselectAll = document.getElementById("sel-deselect-all");
-const selDraw      = document.getElementById("sel-draw");
-const selDelete    = document.getElementById("sel-delete");
+const selDraw       = document.getElementById("sel-draw");
+const selDeleteMode = document.getElementById("sel-delete-mode");
 const selClean     = document.getElementById("sel-clean");
 const selCount     = document.getElementById("sel-count");
 const selWorkspace = document.getElementById("select-workspace");
@@ -297,8 +298,18 @@ translateBtn.addEventListener("click", async () => {
 // PHASE 1: Selection — draw/toggle boxes on original image
 // ══════════════════════════════════════════════════════════════════════════
 
-/* Color a box based on its _selected flag */
+/* Color a box based on its _pendingDelete / _selected flags */
 function styleBox(r) {
+  if (r._pendingDelete) {
+    r.set({
+      fill:            "rgba(243,139,168,0.40)",
+      stroke:          "#f38ba8",
+      strokeWidth:     3,
+      strokeDashArray: null,
+    });
+    return;
+  }
+  r.set({ strokeWidth: 2, strokeDashArray: [6, 3] });
   if (r._selected) {
     r.set({
       fill: r._isCustomRegion ? "rgba(166,227,161,0.25)" : "rgba(137,180,250,0.25)",
@@ -331,11 +342,11 @@ function buildBox(props) {
   return r;
 }
 
-/* Delete all selected boxes (blue/green ones with _selected = true) */
-function deleteSelectedBoxes() {
+/* Delete all boxes currently marked _pendingDelete (Delete Mode lasso) */
+function deletePendingBoxes() {
   if (!selFc) return;
   var toRemove = selFc.getObjects().filter(function(o) {
-    return (o._isOcrRegion || o._isCustomRegion) && o._selected;
+    return (o._isOcrRegion || o._isCustomRegion) && o._pendingDelete;
   });
   if (toRemove.length === 0) return;
   selFc.discardActiveObject();
@@ -390,7 +401,9 @@ function openSelectionPhase() {
   setPhase("select");
   if (selFc) { selFc.dispose(); selFc = null; }
   drawMode = false;
+  deleteMode = false;
   selDraw.classList.remove("tb-active");
+  if (selDeleteMode) selDeleteMode.classList.remove("tb-active");
 
   requestAnimationFrame(function() {
     var wsW = selWorkspace.clientWidth - 80;
@@ -459,7 +472,25 @@ function openSelectionPhase() {
     selFc.on("object:moving",  function() { _didDrag = true; });
     selFc.on("object:scaling", function() { _didDrag = true; });
 
+    /* right-click on any box → immediate delete (single-box, any mode) */
     selFc.on("mouse:down", function(opt) {
+      if (opt.button !== 3) return;
+      var t = opt.target;
+      if (!t || (!t._isOcrRegion && !t._isCustomRegion)) return;
+      if (opt.e && opt.e.preventDefault) opt.e.preventDefault();
+      selFc.remove(t);
+      selFc.renderAll();
+      updateSelCount();
+    });
+
+    /* suppress native context menu over the select canvas */
+    var _selCanvasEl = document.getElementById("select-canvas");
+    if (_selCanvasEl) {
+      _selCanvasEl.oncontextmenu = function(e) { e.preventDefault(); return false; };
+    }
+
+    selFc.on("mouse:down", function(opt) {
+      if (opt.button === 3) return;   // right-click handled above
       _didDrag = false;
       /* start lasso selection when clicking empty space outside draw mode */
       if (!drawMode && !opt.target) {
@@ -493,6 +524,11 @@ function openSelectionPhase() {
           t._regionData.width  = Math.round((t.width  * sx) / selBaseScale);
           t._regionData.height = Math.round((t.height * sy) / selBaseScale);
         }
+      } else if (deleteMode) {
+        /* pure click in delete mode ─ toggle pending-delete mark */
+        t._pendingDelete = !t._pendingDelete;
+        styleBox(t);
+        selFc.renderAll();
       } else {
         /* pure click ─ toggle selected/deselected */
         t._selected = !t._selected;
@@ -510,6 +546,7 @@ function openSelectionPhase() {
     var _lassoRect   = null;
 
     selFc.on("mouse:down", function(opt) {
+      if (opt.button === 3) return;     // right-click is delete, not draw
       if (!drawMode) return;
       if (opt.target) return;           // clicked an existing box
       selFc.discardActiveObject();      // clear selection
@@ -594,7 +631,8 @@ function openSelectionPhase() {
           var oL = obj.left, oT = obj.top;
           var oR = oL + obj.width * sx, oB = oT + obj.height * sy;
           if (oL < lR && oR > lL && oT < lB && oB > lT) {
-            obj._selected = true;
+            if (deleteMode) obj._pendingDelete = true;
+            else            obj._selected      = true;
             styleBox(obj);
           }
         });
@@ -623,8 +661,9 @@ function openSelectionPhase() {
 function _selKeyHandler(e) {
   if (appPhase !== "select" || !selFc) return;
   if (e.key === "Delete" || e.key === "Backspace") {
+    if (!deleteMode) return;   // no-op in normal mode (right-click is the single-delete affordance)
     e.preventDefault();
-    deleteSelectedBoxes();
+    deletePendingBoxes();
   }
 }
 
@@ -663,12 +702,18 @@ selDeselectAll.addEventListener("click", function() {
   updateSelCount();
 });
 
-if (selDelete) selDelete.addEventListener("click", deleteSelectedBoxes);
-
 selDraw.addEventListener("click", function() {
   drawMode = !drawMode;
   selDraw.classList.toggle("tb-active", drawMode);
   if (!selFc) return;
+  /* entering draw mode disables delete mode */
+  if (drawMode && deleteMode) {
+    deleteMode = false;
+    if (selDeleteMode) selDeleteMode.classList.remove("tb-active");
+    selFc.getObjects().forEach(function(o) {
+      if (o._pendingDelete) { o._pendingDelete = false; styleBox(o); }
+    });
+  }
   selFc.defaultCursor = drawMode ? "crosshair" : "default";
   /* while drawing, make existing boxes non-selectable so drags create new rects */
   selFc.forEachObject(function(o) {
@@ -677,6 +722,28 @@ selDraw.addEventListener("click", function() {
     }
   });
   if (drawMode) selFc.discardActiveObject();
+  selFc.renderAll();
+});
+
+if (selDeleteMode) selDeleteMode.addEventListener("click", function() {
+  deleteMode = !deleteMode;
+  selDeleteMode.classList.toggle("tb-active", deleteMode);
+  if (!selFc) return;
+  /* leaving delete mode: clear all pending flags and restyle */
+  if (!deleteMode) {
+    selFc.getObjects().forEach(function(o) {
+      if (o._pendingDelete) { o._pendingDelete = false; styleBox(o); }
+    });
+  }
+  /* mutually exclusive with draw mode */
+  if (deleteMode && drawMode) {
+    drawMode = false;
+    selDraw.classList.remove("tb-active");
+    selFc.forEachObject(function(o) {
+      if (o._isOcrRegion || o._isCustomRegion) o.selectable = true;
+    });
+  }
+  selFc.defaultCursor = deleteMode ? "crosshair" : "default";
   selFc.renderAll();
 });
 
