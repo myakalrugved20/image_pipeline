@@ -426,6 +426,8 @@ function openSelectionPhase() {
       height: dh,
       selection: false,               // no rubber-band multi-select
       preserveObjectStacking: true,
+      fireRightClick: true,           // emit mouse:down for right-click
+      stopContextMenu: true,          // suppress native context menu
     });
 
     /* background -------------------------------------------------------- */
